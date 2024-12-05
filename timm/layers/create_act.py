@@ -4,8 +4,9 @@ Hacked together by / Copyright 2020 Ross Wightman
 from typing import Union, Callable, Type
 
 from .activations import *
+from .activations_jit import *
 from .activations_me import *
-from .config import is_exportable, is_scriptable
+from .config import is_exportable, is_scriptable, is_no_jit
 
 # PyTorch has an optimized, native 'silu' (aka 'swish') operator as of PyTorch 1.7.
 # Also hardsigmoid, hardswish, and soon mish. This code will use native version if present.
@@ -28,12 +29,20 @@ _ACT_FN_DEFAULT = dict(
     selu=F.selu,
     gelu=gelu,
     gelu_tanh=gelu_tanh,
-    quick_gelu=quick_gelu,
     sigmoid=sigmoid,
     tanh=tanh,
     hard_sigmoid=F.hardsigmoid if _has_hardsigmoid else hard_sigmoid,
     hard_swish=F.hardswish if _has_hardswish else hard_swish,
     hard_mish=hard_mish,
+)
+
+_ACT_FN_JIT = dict(
+    silu=F.silu if _has_silu else swish_jit,
+    swish=F.silu if _has_silu else swish_jit,
+    mish=F.mish if _has_mish else mish_jit,
+    hard_sigmoid=F.hardsigmoid if _has_hardsigmoid else hard_sigmoid_jit,
+    hard_swish=F.hardswish if _has_hardswish else hard_swish_jit,
+    hard_mish=hard_mish_jit
 )
 
 _ACT_FN_ME = dict(
@@ -45,7 +54,7 @@ _ACT_FN_ME = dict(
     hard_mish=hard_mish_me,
 )
 
-_ACT_FNS = (_ACT_FN_ME, _ACT_FN_DEFAULT)
+_ACT_FNS = (_ACT_FN_ME, _ACT_FN_JIT, _ACT_FN_DEFAULT)
 for a in _ACT_FNS:
     a.setdefault('hardsigmoid', a.get('hard_sigmoid'))
     a.setdefault('hardswish', a.get('hard_swish'))
@@ -64,13 +73,20 @@ _ACT_LAYER_DEFAULT = dict(
     selu=nn.SELU,
     gelu=GELU,
     gelu_tanh=GELUTanh,
-    quick_gelu=QuickGELU,
     sigmoid=Sigmoid,
     tanh=Tanh,
     hard_sigmoid=nn.Hardsigmoid if _has_hardsigmoid else HardSigmoid,
     hard_swish=nn.Hardswish if _has_hardswish else HardSwish,
     hard_mish=HardMish,
-    identity=nn.Identity,
+)
+
+_ACT_LAYER_JIT = dict(
+    silu=nn.SiLU if _has_silu else SwishJit,
+    swish=nn.SiLU if _has_silu else SwishJit,
+    mish=nn.Mish if _has_mish else MishJit,
+    hard_sigmoid=nn.Hardsigmoid if _has_hardsigmoid else HardSigmoidJit,
+    hard_swish=nn.Hardswish if _has_hardswish else HardSwishJit,
+    hard_mish=HardMishJit
 )
 
 _ACT_LAYER_ME = dict(
@@ -82,7 +98,7 @@ _ACT_LAYER_ME = dict(
     hard_mish=HardMishMe,
 )
 
-_ACT_LAYERS = (_ACT_LAYER_ME, _ACT_LAYER_DEFAULT)
+_ACT_LAYERS = (_ACT_LAYER_ME, _ACT_LAYER_JIT, _ACT_LAYER_DEFAULT)
 for a in _ACT_LAYERS:
     a.setdefault('hardsigmoid', a.get('hard_sigmoid'))
     a.setdefault('hardswish', a.get('hard_swish'))
@@ -97,12 +113,14 @@ def get_act_fn(name: Union[Callable, str] = 'relu'):
         return None
     if isinstance(name, Callable):
         return name
-    name = name.lower()
-    if not (is_exportable() or is_scriptable()):
+    if not (is_no_jit() or is_exportable() or is_scriptable()):
         # If not exporting or scripting the model, first look for a memory-efficient version with
         # custom autograd, then fallback
         if name in _ACT_FN_ME:
             return _ACT_FN_ME[name]
+    if not (is_no_jit() or is_exportable()):
+        if name in _ACT_FN_JIT:
+            return _ACT_FN_JIT[name]
     return _ACT_FN_DEFAULT[name]
 
 
@@ -111,21 +129,21 @@ def get_act_layer(name: Union[Type[nn.Module], str] = 'relu'):
     Fetching activation layers by name with this function allows export or torch script friendly
     functions to be returned dynamically based on current config.
     """
-    if name is None:
+    if not name:
         return None
     if not isinstance(name, str):
         # callable, module, etc
         return name
-    if not name:
-        return None
-    name = name.lower()
-    if not (is_exportable() or is_scriptable()):
+    if not (is_no_jit() or is_exportable() or is_scriptable()):
         if name in _ACT_LAYER_ME:
             return _ACT_LAYER_ME[name]
+    if not (is_no_jit() or is_exportable()):
+        if name in _ACT_LAYER_JIT:
+            return _ACT_LAYER_JIT[name]
     return _ACT_LAYER_DEFAULT[name]
 
 
-def create_act_layer(name: Union[Type[nn.Module], str], inplace=None, **kwargs):
+def create_act_layer(name: Union[nn.Module, str], inplace=None, **kwargs):
     act_layer = get_act_layer(name)
     if act_layer is None:
         return None

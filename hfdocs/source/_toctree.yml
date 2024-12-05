@@ -5,8 +5,6 @@
     title: Quickstart
   - local: installation
     title: Installation
-  - local: changes
-    title: Changelog
   title: Get started
 - sections:
   - local: feature_extraction

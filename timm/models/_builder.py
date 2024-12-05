@@ -2,16 +2,15 @@ import dataclasses
 import logging
 import os
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Optional, Dict, Callable, Any, Tuple
 
 from torch import nn as nn
 from torch.hub import load_state_dict_from_url
 
-from timm.models._features import FeatureListNet, FeatureDictNet, FeatureHookNet, FeatureGetterNet
+from timm.models._features import FeatureListNet, FeatureHookNet
 from timm.models._features_fx import FeatureGraphNet
 from timm.models._helpers import load_state_dict
-from timm.models._hub import has_hf_hub, download_cached_file, check_cached_file, load_state_dict_from_hf,\
-    load_custom_from_hf
+from timm.models._hub import has_hf_hub, download_cached_file, check_cached_file, load_state_dict_from_hf
 from timm.models._manipulate import adapt_input_conv
 from timm.models._pretrained import PretrainedCfg
 from timm.models._prune import adapt_model_from_file
@@ -23,7 +22,7 @@ _logger = logging.getLogger(__name__)
 # Use set_pretrained_download_progress / set_pretrained_check_hash functions to toggle.
 _DOWNLOAD_PROGRESS = False
 _CHECK_HASH = False
-_USE_OLD_CACHE = int(os.environ.get('TIMM_USE_OLD_CACHE', 0)) > 0
+
 
 __all__ = ['set_pretrained_download_progress', 'set_pretrained_check_hash', 'load_custom_pretrained', 'load_pretrained',
            'pretrained_cfg_for_features', 'resolve_pretrained_cfg', 'build_model_with_cfg']
@@ -33,7 +32,6 @@ def _resolve_pretrained_source(pretrained_cfg):
     cfg_source = pretrained_cfg.get('source', '')
     pretrained_url = pretrained_cfg.get('url', None)
     pretrained_file = pretrained_cfg.get('file', None)
-    pretrained_sd = pretrained_cfg.get('state_dict', None)
     hf_hub_id = pretrained_cfg.get('hf_hub_id', None)
 
     # resolve where to load pretrained weights from
@@ -46,21 +44,14 @@ def _resolve_pretrained_source(pretrained_cfg):
         pretrained_loc = hf_hub_id
     else:
         # default source == timm or unspecified
-        if pretrained_sd:
-            # direct state_dict pass through is the highest priority
-            load_from = 'state_dict'
-            pretrained_loc = pretrained_sd
-            assert isinstance(pretrained_loc, dict)
-        elif pretrained_file:
-            # file load override is the second-highest priority if set
+        if pretrained_file:
+            # file load override is the highest priority if set
             load_from = 'file'
             pretrained_loc = pretrained_file
         else:
-            old_cache_valid = False
-            if _USE_OLD_CACHE:
-                # prioritized old cached weights if exists and env var enabled
-                old_cache_valid = check_cached_file(pretrained_url) if pretrained_url else False
-            if not old_cache_valid and hf_hub_id and has_hf_hub(necessary=True):
+            # next, HF hub is prioritized unless a valid cached version of weights exists already
+            cached_url_valid = check_cached_file(pretrained_url) if pretrained_url else False
+            if hf_hub_id and has_hf_hub(necessary=True) and not cached_url_valid:
                 # hf-hub available as alternate weight source in default_cfg
                 load_from = 'hf-hub'
                 pretrained_loc = hf_hub_id
@@ -115,7 +106,7 @@ def load_custom_pretrained(
     if not load_from:
         _logger.warning("No pretrained weights exist for this model. Using random initialization.")
         return
-    if load_from == 'hf-hub':
+    if load_from == 'hf-hub':  # FIXME
         _logger.warning("Hugging Face hub not currently supported for custom load pretrained models.")
     elif load_from == 'url':
         pretrained_loc = download_cached_file(
@@ -153,19 +144,13 @@ def load_pretrained(
     """
     pretrained_cfg = pretrained_cfg or getattr(model, 'pretrained_cfg', None)
     if not pretrained_cfg:
-        raise RuntimeError("Invalid pretrained config, cannot load weights. Use `pretrained=False` for random init.")
+        _logger.warning("Invalid pretrained config, cannot load weights.")
+        return
 
     load_from, pretrained_loc = _resolve_pretrained_source(pretrained_cfg)
-    if load_from == 'state_dict':
-        _logger.info(f'Loading pretrained weights from state dict')
-        state_dict = pretrained_loc  # pretrained_loc is the actual state dict for this override
-    elif load_from == 'file':
+    if load_from == 'file':
         _logger.info(f'Loading pretrained weights from file ({pretrained_loc})')
-        if pretrained_cfg.get('custom_load', False):
-            model.load_pretrained(pretrained_loc)
-            return
-        else:
-            state_dict = load_state_dict(pretrained_loc)
+        state_dict = load_state_dict(pretrained_loc)
     elif load_from == 'url':
         _logger.info(f'Loading pretrained weights from url ({pretrained_loc})')
         if pretrained_cfg.get('custom_load', False):
@@ -177,35 +162,21 @@ def load_pretrained(
             model.load_pretrained(pretrained_loc)
             return
         else:
-            try:
-                state_dict = load_state_dict_from_url(
-                    pretrained_loc,
-                    map_location='cpu',
-                    progress=_DOWNLOAD_PROGRESS,
-                    check_hash=_CHECK_HASH,
-                    weights_only=True,
-                )
-            except TypeError:
-                state_dict = load_state_dict_from_url(
-                    pretrained_loc,
-                    map_location='cpu',
-                    progress=_DOWNLOAD_PROGRESS,
-                    check_hash=_CHECK_HASH,
-                )
+            state_dict = load_state_dict_from_url(
+                pretrained_loc,
+                map_location='cpu',
+                progress=_DOWNLOAD_PROGRESS,
+                check_hash=_CHECK_HASH,
+            )
     elif load_from == 'hf-hub':
         _logger.info(f'Loading pretrained weights from Hugging Face hub ({pretrained_loc})')
         if isinstance(pretrained_loc, (list, tuple)):
-            custom_load = pretrained_cfg.get('custom_load', False)
-            if isinstance(custom_load, str) and custom_load == 'hf':
-                load_custom_from_hf(*pretrained_loc, model)
-                return
-            else:
-                state_dict = load_state_dict_from_hf(*pretrained_loc)
+            state_dict = load_state_dict_from_hf(*pretrained_loc)
         else:
-            state_dict = load_state_dict_from_hf(pretrained_loc, weights_only=True)
+            state_dict = load_state_dict_from_hf(pretrained_loc)
     else:
-        model_name = pretrained_cfg.get('architecture', 'this model')
-        raise RuntimeError(f"No pretrained weights exist for {model_name}. Use `pretrained=False` for random init.")
+        _logger.warning("No pretrained weights exist or were found for this model. Using random initialization.")
+        return
 
     if filter_fn is not None:
         try:
@@ -249,15 +220,7 @@ def load_pretrained(
                 classifier_bias = state_dict[classifier_name + '.bias']
                 state_dict[classifier_name + '.bias'] = classifier_bias[label_offset:]
 
-    load_result = model.load_state_dict(state_dict, strict=strict)
-    if load_result.missing_keys:
-        _logger.info(
-            f'Missing keys ({", ".join(load_result.missing_keys)}) discovered while loading pretrained weights.'
-            f' This is expected if model is being adapted.')
-    if load_result.unexpected_keys:
-        _logger.warning(
-            f'Unexpected keys ({", ".join(load_result.unexpected_keys)}) found while loading pretrained weights.'
-            f' This may be expected if model is being adapted.')
+    model.load_state_dict(state_dict, strict=strict)
 
 
 def pretrained_cfg_for_features(pretrained_cfg):
@@ -276,7 +239,7 @@ def _filter_kwargs(kwargs, names):
         kwargs.pop(n, None)
 
 
-def _update_default_model_kwargs(pretrained_cfg, kwargs, kwargs_filter):
+def _update_default_kwargs(pretrained_cfg, kwargs, kwargs_filter):
     """ Update the default_cfg and kwargs before passing to model
 
     Args:
@@ -303,11 +266,6 @@ def _update_default_model_kwargs(pretrained_cfg, kwargs, kwargs_filter):
             if input_size is not None:
                 assert len(input_size) == 3
                 kwargs.setdefault(n, input_size[0])
-        elif n == 'num_classes':
-            default_val = pretrained_cfg.get(n, None)
-            # if default is < 0, don't pass through to model
-            if default_val is not None and default_val >= 0:
-                kwargs.setdefault(n, pretrained_cfg[n])
         else:
             default_val = pretrained_cfg.get(n, None)
             if default_val is not None:
@@ -374,15 +332,15 @@ def build_model_with_cfg(
       * pruning config / model adaptation
 
     Args:
-        model_cls: model class
-        variant: model variant name
-        pretrained: load pretrained weights
-        pretrained_cfg: model's pretrained weight/task config
-        model_cfg: model's architecture config
-        feature_cfg: feature extraction adapter config
-        pretrained_strict: load pretrained weights strictly
-        pretrained_filter_fn: filter callable for pretrained weights
-        kwargs_filter: kwargs to filter before passing to model
+        model_cls (nn.Module): model class
+        variant (str): model variant name
+        pretrained (bool): load pretrained weights
+        pretrained_cfg (dict): model's pretrained weight/task config
+        model_cfg (Optional[Dict]): model's architecture config
+        feature_cfg (Optional[Dict]: feature extraction adapter config
+        pretrained_strict (bool): load pretrained weights strictly
+        pretrained_filter_fn (Optional[Callable]): filter callable for pretrained weights
+        kwargs_filter (Optional[Tuple]): kwargs to filter before passing to model
         **kwargs: model args passed through to model __init__
     """
     pruned = kwargs.pop('pruned', False)
@@ -399,7 +357,7 @@ def build_model_with_cfg(
     # FIXME converting back to dict, PretrainedCfg use should be propagated further, but not into model
     pretrained_cfg = pretrained_cfg.to_dict()
 
-    _update_default_model_kwargs(pretrained_cfg, kwargs, kwargs_filter)
+    _update_default_kwargs(pretrained_cfg, kwargs, kwargs_filter)
 
     # Setup for feature extraction wrapper done at end of this fn
     if kwargs.pop('features_only', False):
@@ -407,8 +365,6 @@ def build_model_with_cfg(
         feature_cfg.setdefault('out_indices', (0, 1, 2, 3, 4))
         if 'out_indices' in kwargs:
             feature_cfg['out_indices'] = kwargs.pop('out_indices')
-        if 'feature_cls' in kwargs:
-            feature_cfg['feature_cls'] = kwargs.pop('feature_cls')
 
     # Instantiate the model
     if model_cfg is None:
@@ -435,38 +391,19 @@ def build_model_with_cfg(
 
     # Wrap the model in a feature extraction module if enabled
     if features:
-        use_getter = False
+        feature_cls = FeatureListNet
         if 'feature_cls' in feature_cfg:
             feature_cls = feature_cfg.pop('feature_cls')
             if isinstance(feature_cls, str):
                 feature_cls = feature_cls.lower()
-
-                # flatten_sequential only valid for some feature extractors
-                if feature_cls not in ('dict', 'list', 'hook'):
-                    feature_cfg.pop('flatten_sequential', None)
-
                 if 'hook' in feature_cls:
                     feature_cls = FeatureHookNet
-                elif feature_cls == 'list':
-                    feature_cls = FeatureListNet
-                elif feature_cls == 'dict':
-                    feature_cls = FeatureDictNet
                 elif feature_cls == 'fx':
                     feature_cls = FeatureGraphNet
-                elif feature_cls == 'getter':
-                    use_getter = True
-                    feature_cls = FeatureGetterNet
                 else:
                     assert False, f'Unknown feature class {feature_cls}'
-        else:
-            feature_cls = FeatureListNet
-
-        output_fmt = getattr(model, 'output_fmt', None)
-        if output_fmt is not None and not use_getter:  # don't set default for intermediate feat getter
-            feature_cfg.setdefault('output_fmt', output_fmt)
-
         model = feature_cls(model, **feature_cfg)
-        model.pretrained_cfg = pretrained_cfg_for_features(pretrained_cfg)  # add back pretrained cfg
-        model.default_cfg = model.pretrained_cfg  # alias for rename backwards compat (default_cfg -> pretrained_cfg)
+        model.pretrained_cfg = pretrained_cfg_for_features(pretrained_cfg)  # add back default_cfg
+        model.default_cfg = model.pretrained_cfg  # alias for backwards compat
 
     return model

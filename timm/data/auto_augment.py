@@ -54,7 +54,8 @@ def _interpolation(kwargs):
     interpolation = kwargs.pop('resample', _DEFAULT_INTERPOLATION)
     if isinstance(interpolation, (list, tuple)):
         return random.choice(interpolation)
-    return interpolation
+    else:
+        return interpolation
 
 
 def _check_args_tf(kwargs):
@@ -99,7 +100,7 @@ def rotate(img, degrees, **kwargs):
     _check_args_tf(kwargs)
     if _PIL_VER >= (5, 2):
         return img.rotate(degrees, **kwargs)
-    if _PIL_VER >= (5, 0):
+    elif _PIL_VER >= (5, 0):
         w, h = img.size
         post_trans = (0, 0)
         rotn_center = (w / 2.0, h / 2.0)
@@ -123,7 +124,8 @@ def rotate(img, degrees, **kwargs):
         matrix[2] += rotn_center[0]
         matrix[5] += rotn_center[1]
         return img.transform(img.size, Image.AFFINE, matrix, **kwargs)
-    return img.rotate(degrees, resample=kwargs['resample'])
+    else:
+        return img.rotate(degrees, resample=kwargs['resample'])
 
 
 def auto_contrast(img, **__):
@@ -149,13 +151,12 @@ def solarize_add(img, add, thresh=128, **__):
             lut.append(min(255, i + add))
         else:
             lut.append(i)
-
     if img.mode in ("L", "RGB"):
         if img.mode == "RGB" and len(lut) == 256:
             lut = lut + lut + lut
         return img.point(lut)
-
-    return img
+    else:
+        return img
 
 
 def posterize(img, bits_to_keep, **__):
@@ -225,7 +226,7 @@ def _enhance_increasing_level_to_arg(level, _hparams):
 
 def _minmax_level_to_arg(level, _hparams, min_val=0., max_val=1.0, clamp=True):
     level = (level / _LEVEL_DENOM)
-    level = min_val + (max_val - min_val) * level
+    min_val + (max_val - min_val) * level
     if clamp:
         level = max(min_val, min(max_val, level))
     return level,
@@ -551,15 +552,16 @@ def auto_augment_policy(name='v0', hparams=None):
     hparams = hparams or _HPARAMS_DEFAULT
     if name == 'original':
         return auto_augment_policy_original(hparams)
-    if name == 'originalr':
+    elif name == 'originalr':
         return auto_augment_policy_originalr(hparams)
-    if name == 'v0':
+    elif name == 'v0':
         return auto_augment_policy_v0(hparams)
-    if name == 'v0r':
+    elif name == 'v0r':
         return auto_augment_policy_v0r(hparams)
-    if name == '3a':
+    elif name == '3a':
         return auto_augment_policy_3a(hparams)
-    assert False, f'Unknown AA policy {name}'
+    else:
+        assert False, 'Unknown AA policy (%s)' % name
 
 
 class AutoAugment:
@@ -574,7 +576,7 @@ class AutoAugment:
         return img
 
     def __repr__(self):
-        fs = self.__class__.__name__ + '(policy='
+        fs = self.__class__.__name__ + f'(policy='
         for p in self.policy:
             fs += '\n\t['
             fs += ', '.join([str(op) for op in p])
@@ -584,22 +586,22 @@ class AutoAugment:
 
 
 def auto_augment_transform(config_str: str, hparams: Optional[Dict] = None):
-    """ Create a AutoAugment transform
+    """
+    Create a AutoAugment transform
 
     Args:
         config_str: String defining configuration of auto augmentation. Consists of multiple sections separated by
             dashes ('-').
             The first section defines the AutoAugment policy (one of 'v0', 'v0r', 'original', 'originalr').
-            While the remaining sections define other arguments
-                * 'mstd' -  float std deviation of magnitude noise applied
+
+            The remaining sections:
+                'mstd' -  float std deviation of magnitude noise applied
+            Ex 'original-mstd0.5' results in AutoAugment with original policy, magnitude_std 0.5
+
         hparams: Other hparams (kwargs) for the AutoAugmentation scheme
 
     Returns:
          A PyTorch compatible Transform
-
-    Examples::
-
-        'original-mstd0.5' results in AutoAugment with original policy, magnitude_std 0.5
     """
     config = config_str.split('-')
     policy_name = config[0]
@@ -634,7 +636,7 @@ _RAND_TRANSFORMS = [
     'ShearY',
     'TranslateXRel',
     'TranslateYRel',
-    # 'Cutout'  # NOTE I've implement this as random erasing separately
+    #'Cutout'  # NOTE I've implement this as random erasing separately
 ]
 
 
@@ -654,7 +656,7 @@ _RAND_INCREASING_TRANSFORMS = [
     'ShearY',
     'TranslateXRel',
     'TranslateYRel',
-    # 'Cutout'  # NOTE I've implement this as random erasing separately
+    #'Cutout'  # NOTE I've implement this as random erasing separately
 ]
 
 
@@ -665,7 +667,7 @@ _RAND_3A = [
 ]
 
 
-_RAND_WEIGHTED_3A = {
+_RAND_CHOICE_3A = {
     'SolarizeIncreasing': 6,
     'Desaturate': 6,
     'GaussianBlur': 6,
@@ -685,7 +687,7 @@ _RAND_WEIGHTED_3A = {
 
 # These experimental weights are based loosely on the relative improvements mentioned in paper.
 # They may not result in increased performance, but could likely be tuned to so.
-_RAND_WEIGHTED_0 = {
+_RAND_CHOICE_WEIGHTS_0 = {
     'Rotate': 3,
     'ShearX': 2,
     'ShearY': 2,
@@ -713,12 +715,13 @@ def _get_weighted_transforms(transforms: Dict):
 
 def rand_augment_choices(name: str, increasing=True):
     if name == 'weights':
-        return _RAND_WEIGHTED_0
-    if name == '3aw':
-        return _RAND_WEIGHTED_3A
-    if name == '3a':
+        return _RAND_CHOICE_WEIGHTS_0
+    elif name == '3aw':
+        return _RAND_CHOICE_3A
+    elif name == '3a':
         return _RAND_3A
-    return _RAND_INCREASING_TRANSFORMS if increasing else _RAND_TRANSFORMS
+    else:
+        return _RAND_INCREASING_TRANSFORMS if increasing else _RAND_TRANSFORMS
 
 
 def rand_augment_ops(
@@ -764,30 +767,27 @@ def rand_augment_transform(
         hparams: Optional[Dict] = None,
         transforms: Optional[Union[str, Dict, List]] = None,
 ):
-    """ Create a RandAugment transform
+    """
+    Create a RandAugment transform
 
     Args:
         config_str (str): String defining configuration of random augmentation. Consists of multiple sections separated
             by dashes ('-'). The first section defines the specific variant of rand augment (currently only 'rand').
-            The remaining sections, not order specific determine
-                * 'm' - integer magnitude of rand augment
-                * 'n' - integer num layers (number of transform ops selected per image)
-                * 'p' - float probability of applying each layer (default 0.5)
-                * 'mstd' -  float std deviation of magnitude noise applied, or uniform sampling if infinity (or > 100)
-                * 'mmax' - set upper bound for magnitude to something other than default of  _LEVEL_DENOM (10)
-                * 'inc' - integer (bool), use augmentations that increase in severity with magnitude (default: 0)
-                * 't' - str name of transform set to use
+            The remaining sections, not order sepecific determine
+                'm' - integer magnitude of rand augment
+                'n' - integer num layers (number of transform ops selected per image)
+                'p' - float probability of applying each layer (default 0.5)
+                'mstd' -  float std deviation of magnitude noise applied, or uniform sampling if infinity (or > 100)
+                'mmax' - set upper bound for magnitude to something other than default of  _LEVEL_DENOM (10)
+                'inc' - integer (bool), use augmentations that increase in severity with magnitude (default: 0)
+                't' - str name of transform set to use
+            Ex 'rand-m9-n3-mstd0.5' results in RandAugment with magnitude 9, num_layers 3, magnitude_std 0.5
+            'rand-mstd1-tweights' results in mag std 1.0, weighted transforms, default mag of 10 and num_layers 2
+
         hparams (dict): Other hparams (kwargs) for the RandAugmentation scheme
 
     Returns:
          A PyTorch compatible Transform
-
-    Examples::
-
-        'rand-m9-n3-mstd0.5' results in RandAugment with magnitude 9, num_layers 3, magnitude_std 0.5
-
-        'rand-mstd1-tweights' results in mag std 1.0, weighted transforms, default mag of 10 and num_layers 2
-
     """
     magnitude = _LEVEL_DENOM  # default to _LEVEL_DENOM for magnitude (currently 10)
     num_layers = 2  # default to 2 ops per image

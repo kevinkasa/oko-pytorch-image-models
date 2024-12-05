@@ -1,15 +1,8 @@
 import torch
 import torch.nn as nn
 
-from timm.layers import create_act_layer, set_layer_config, get_act_layer, get_act_fn
+from timm.layers import create_act_layer, set_layer_config
 
-import importlib
-import os
-
-torch_backend = os.environ.get('TORCH_BACKEND')
-if torch_backend is not None:
-    importlib.import_module(torch_backend)
-torch_device = os.environ.get('TORCH_DEVICE', 'cpu')
 
 class MLP(nn.Module):
     def __init__(self, act_layer="relu", inplace=True):
@@ -36,9 +29,6 @@ def _run_act_layer_grad(act_type, inplace=True):
         out = m(x)
         l = (out - 0).pow(2).sum()
         return l
-
-    x = x.to(device=torch_device)
-    m.to(device=torch_device)
 
     out_me = _run(x)
 
@@ -76,46 +66,3 @@ def test_hard_swish_grad():
 def test_hard_mish_grad():
     for _ in range(100):
         _run_act_layer_grad('hard_mish')
-
-def test_get_act_layer_empty_string():
-    # Empty string should return None
-    assert get_act_layer('') is None
-
-
-def test_create_act_layer_inplace_error():
-    class NoInplaceAct(nn.Module):
-        def __init__(self):
-            super().__init__()
-        def forward(self, x):
-            return x
-    
-    # Should recover when inplace arg causes TypeError
-    layer = create_act_layer(NoInplaceAct, inplace=True)
-    assert isinstance(layer, NoInplaceAct)
-
-
-def test_create_act_layer_edge_cases():
-    # Test None input
-    assert create_act_layer(None) is None
-    
-    # Test TypeError handling for inplace
-    class CustomAct(nn.Module):
-        def __init__(self, **kwargs):
-            super().__init__()
-        def forward(self, x):
-            return x
-            
-    result = create_act_layer(CustomAct, inplace=True)
-    assert isinstance(result, CustomAct)
-
-
-def test_get_act_fn_callable():
-    def custom_act(x): 
-        return x
-    assert get_act_fn(custom_act) is custom_act
-
-
-def test_get_act_fn_none():
-    assert get_act_fn(None) is None
-    assert get_act_fn('') is None
-

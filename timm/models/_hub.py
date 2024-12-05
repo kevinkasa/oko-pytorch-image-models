@@ -5,7 +5,7 @@ import os
 from functools import partial
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Iterable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch.hub import HASH_REGEX, download_url_to_file, urlparse
@@ -14,17 +14,6 @@ try:
     from torch.hub import get_dir
 except ImportError:
     from torch.hub import _get_torch_home as get_dir
-
-try:
-    import safetensors.torch
-    _has_safetensors = True
-except ImportError:
-    _has_safetensors = False
-
-try:
-    from typing import Literal
-except ImportError:
-    from typing_extensions import Literal
 
 from timm import __version__
 from timm.models._pretrained import filter_pretrained_cfg
@@ -45,12 +34,6 @@ _logger = logging.getLogger(__name__)
 
 __all__ = ['get_cache_dir', 'download_cached_file', 'has_hf_hub', 'hf_split', 'load_model_config_from_hf',
            'load_state_dict_from_hf', 'save_for_hf', 'push_to_hf_hub']
-
-# Default name for a weights file hosted on the Huggingface Hub.
-HF_WEIGHTS_NAME = "pytorch_model.bin"  # default pytorch pkl
-HF_SAFE_WEIGHTS_NAME = "model.safetensors"  # safetensors version
-HF_OPEN_CLIP_WEIGHTS_NAME = "open_clip_pytorch_model.bin"  # default pytorch pkl
-HF_OPEN_CLIP_SAFE_WEIGHTS_NAME = "open_clip_model.safetensors"  # safetensors version
 
 
 def get_cache_dir(child_dir=''):
@@ -163,68 +146,29 @@ def load_model_config_from_hf(model_id: str):
     if 'label_descriptions' in hf_config:
         pretrained_cfg['label_descriptions'] = hf_config.pop('label_descriptions')
 
-    model_args = hf_config.get('model_args', {})
     model_name = hf_config['architecture']
-    return pretrained_cfg, model_name, model_args
+    return pretrained_cfg, model_name
 
 
-def load_state_dict_from_hf(
-        model_id: str,
-        filename: str = HF_WEIGHTS_NAME,
-        weights_only: bool = False,
-):
+def load_state_dict_from_hf(model_id: str, filename: str = 'pytorch_model.bin'):
     assert has_hf_hub(True)
-    hf_model_id, hf_revision = hf_split(model_id)
-
-    # Look for .safetensors alternatives and load from it if it exists
-    if _has_safetensors:
-        for safe_filename in _get_safe_alternatives(filename):
-            try:
-                cached_safe_file = hf_hub_download(repo_id=hf_model_id, filename=safe_filename, revision=hf_revision)
-                _logger.info(
-                    f"[{model_id}] Safe alternative available for '{filename}' "
-                    f"(as '{safe_filename}'). Loading weights using safetensors.")
-                return safetensors.torch.load_file(cached_safe_file, device="cpu")
-            except EntryNotFoundError:
-                pass
-
-    # Otherwise, load using pytorch.load
-    cached_file = hf_hub_download(hf_model_id, filename=filename, revision=hf_revision)
-    _logger.debug(f"[{model_id}] Safe alternative not found for '{filename}'. Loading weights using default pytorch.")
-    try:
-        state_dict = torch.load(cached_file, map_location='cpu', weights_only=weights_only)
-    except TypeError:
-        state_dict = torch.load(cached_file, map_location='cpu')
+    cached_file = download_from_hf(model_id, filename)
+    state_dict = torch.load(cached_file, map_location='cpu')
     return state_dict
 
 
-def load_custom_from_hf(model_id: str, filename: str, model: torch.nn.Module):
-    assert has_hf_hub(True)
-    hf_model_id, hf_revision = hf_split(model_id)
-    cached_file = hf_hub_download(hf_model_id, filename=filename, revision=hf_revision)
-    return model.load_pretrained(cached_file)
-
-
-def save_config_for_hf(
-        model,
-        config_path: str,
-        model_config: Optional[dict] = None,
-        model_args: Optional[dict] = None
-):
+def save_config_for_hf(model, config_path: str, model_config: Optional[dict] = None):
     model_config = model_config or {}
     hf_config = {}
     pretrained_cfg = filter_pretrained_cfg(model.pretrained_cfg, remove_source=True, remove_null=True)
     # set some values at root config level
     hf_config['architecture'] = pretrained_cfg.pop('architecture')
-    hf_config['num_classes'] = model_config.pop('num_classes', model.num_classes)
-
-    # NOTE these attr saved for informational purposes, do not impact model build
-    hf_config['num_features'] = model_config.pop('num_features', model.num_features)
-    global_pool_type = model_config.pop('global_pool', getattr(model, 'global_pool', None))
+    hf_config['num_classes'] = model_config.get('num_classes', model.num_classes)
+    hf_config['num_features'] = model_config.get('num_features', model.num_features)
+    global_pool_type = model_config.get('global_pool', getattr(model, 'global_pool', None))
     if isinstance(global_pool_type, str) and global_pool_type:
         hf_config['global_pool'] = global_pool_type
 
-    # Save class label info
     if 'labels' in model_config:
         _logger.warning(
             "'labels' as a config field for is deprecated. Please use 'label_names' and 'label_descriptions'."
@@ -244,9 +188,6 @@ def save_config_for_hf(
         # maps label names -> descriptions
         hf_config['label_descriptions'] = label_descriptions
 
-    if model_args:
-        hf_config['model_args'] = model_args
-
     hf_config['pretrained_cfg'] = pretrained_cfg
     hf_config.update(model_config)
 
@@ -254,54 +195,29 @@ def save_config_for_hf(
         json.dump(hf_config, f, indent=2)
 
 
-def save_for_hf(
-        model,
-        save_directory: str,
-        model_config: Optional[dict] = None,
-        model_args: Optional[dict] = None,
-        safe_serialization: Union[bool, Literal["both"]] = False,
-):
+def save_for_hf(model, save_directory: str, model_config: Optional[dict] = None):
     assert has_hf_hub(True)
     save_directory = Path(save_directory)
     save_directory.mkdir(exist_ok=True, parents=True)
 
-    # Save model weights, either safely (using safetensors), or using legacy pytorch approach or both.
-    tensors = model.state_dict()
-    if safe_serialization is True or safe_serialization == "both":
-        assert _has_safetensors, "`pip install safetensors` to use .safetensors"
-        safetensors.torch.save_file(tensors, save_directory / HF_SAFE_WEIGHTS_NAME)
-    if safe_serialization is False or safe_serialization == "both":
-        torch.save(tensors, save_directory / HF_WEIGHTS_NAME)
+    weights_path = save_directory / 'pytorch_model.bin'
+    torch.save(model.state_dict(), weights_path)
 
     config_path = save_directory / 'config.json'
-    save_config_for_hf(
-        model,
-        config_path,
-        model_config=model_config,
-        model_args=model_args,
-    )
+    save_config_for_hf(model, config_path, model_config=model_config)
 
 
 def push_to_hf_hub(
-        model: torch.nn.Module,
-        repo_id: str,
-        commit_message: str = 'Add model',
-        token: Optional[str] = None,
-        revision: Optional[str] = None,
-        private: bool = False,
-        create_pr: bool = False,
-        model_config: Optional[dict] = None,
-        model_card: Optional[dict] = None,
-        model_args: Optional[dict] = None,
-        safe_serialization: Union[bool, Literal["both"]] = 'both',
+    model,
+    repo_id: str,
+    commit_message: str = 'Add model',
+    token: Optional[str] = None,
+    revision: Optional[str] = None,
+    private: bool = False,
+    create_pr: bool = False,
+    model_config: Optional[dict] = None,
+    model_card: Optional[dict] = None,
 ):
-    """
-    Arguments:
-        (...)
-        safe_serialization (`bool` or `"both"`, *optional*, defaults to `False`):
-            Whether to save the model using `safetensors` or the traditional PyTorch way (that uses `pickle`).
-            Can be set to `"both"` in order to push both safe and unsafe weights.
-    """
     # Create repo if it doesn't exist yet
     repo_url = create_repo(repo_id, token=token, private=private, exist_ok=True)
 
@@ -320,13 +236,7 @@ def push_to_hf_hub(
     # Dump model and push to Hub
     with TemporaryDirectory() as tmpdir:
         # Save model weights and config.
-        save_for_hf(
-            model,
-            tmpdir,
-            model_config=model_config,
-            model_args=model_args,
-            safe_serialization=safe_serialization,
-        )
+        save_for_hf(model, tmpdir, model_config=model_config)
 
         # Add readme if it does not exist
         if not has_readme:
@@ -349,21 +259,13 @@ def push_to_hf_hub(
 def generate_readme(model_card: dict, model_name: str):
     readme_text = "---\n"
     readme_text += "tags:\n- image-classification\n- timm\n"
-    readme_text += "library_name: timm\n"
+    readme_text += "library_tag: timm\n"
     readme_text += f"license: {model_card.get('license', 'apache-2.0')}\n"
     if 'details' in model_card and 'Dataset' in model_card['details']:
         readme_text += 'datasets:\n'
-        if isinstance(model_card['details']['Dataset'], (tuple, list)):
-            for d in model_card['details']['Dataset']:
-                readme_text += f"- {d.lower()}\n"
-        else:
-            readme_text += f"- {model_card['details']['Dataset'].lower()}\n"
+        readme_text += f"- {model_card['details']['Dataset'].lower()}\n"
         if 'Pretrain Dataset' in model_card['details']:
-            if isinstance(model_card['details']['Pretrain Dataset'], (tuple, list)):
-                for d in model_card['details']['Pretrain Dataset']:
-                    readme_text += f"- {d.lower()}\n"
-            else:
-                readme_text += f"- {model_card['details']['Pretrain Dataset'].lower()}\n"
+            readme_text += f"- {model_card['details']['Pretrain Dataset'].lower()}\n"
     readme_text += "---\n"
     readme_text += f"# Model card for {model_name}\n"
     if 'description' in model_card:
@@ -400,18 +302,3 @@ def generate_readme(model_card: dict, model_name: str):
         for c in citations:
             readme_text += f"```bibtex\n{c}\n```\n"
     return readme_text
-
-
-def _get_safe_alternatives(filename: str) -> Iterable[str]:
-    """Returns potential safetensors alternatives for a given filename.
-
-    Use case:
-        When downloading a model from the Huggingface Hub, we first look if a .safetensors file exists and if yes, we use it.
-        Main use case is filename "pytorch_model.bin" => check for "model.safetensors" or "pytorch_model.safetensors".
-    """
-    if filename == HF_WEIGHTS_NAME:
-        yield HF_SAFE_WEIGHTS_NAME
-    if filename == HF_OPEN_CLIP_WEIGHTS_NAME:
-        yield HF_OPEN_CLIP_SAFE_WEIGHTS_NAME
-    if filename not in (HF_WEIGHTS_NAME, HF_OPEN_CLIP_WEIGHTS_NAME) and filename.endswith(".bin"):
-        yield filename[:-4] + ".safetensors"

@@ -50,8 +50,6 @@ def create_norm_act_layer(layer_name, num_features, act_layer=None, apply_act=Tr
 
 
 def get_norm_act_layer(norm_layer, act_layer=None):
-    if norm_layer is None:
-        return None
     assert isinstance(norm_layer, (type, str,  types.FunctionType, functools.partial))
     assert act_layer is None or isinstance(act_layer, (type, str, types.FunctionType, functools.partial))
     norm_act_kwargs = {}
@@ -62,10 +60,8 @@ def get_norm_act_layer(norm_layer, act_layer=None):
         norm_layer = norm_layer.func
 
     if isinstance(norm_layer, str):
-        if not norm_layer:
-            return None
         layer_name = norm_layer.replace('_', '').lower().split('-')[0]
-        norm_act_layer = _NORM_ACT_MAP[layer_name]
+        norm_act_layer = _NORM_ACT_MAP.get(layer_name, None)
     elif norm_layer in _NORM_ACT_TYPES:
         norm_act_layer = norm_layer
     elif isinstance(norm_layer,  types.FunctionType):

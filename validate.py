@@ -18,6 +18,8 @@ from collections import OrderedDict
 from contextlib import suppress
 from functools import partial
 
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -26,13 +28,23 @@ from timm.data import create_dataset, create_loader, resolve_data_config, RealLa
 from timm.layers import apply_test_time_pool, set_fast_norm
 from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
-    decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
+    decay_batch_step, check_batch_size_retry, ParseKwargs
+import utils
+from netcal.metrics import ECE, ACE
+from torch.nn import functional as F
 
 try:
     from apex import amp
     has_apex = True
 except ImportError:
     has_apex = False
+
+has_native_amp = False
+try:
+    if getattr(torch.cuda.amp, 'autocast') is not None:
+        has_native_amp = True
+except AttributeError:
+    pass
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -54,25 +66,12 @@ parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
 parser.add_argument('--split', metavar='NAME', default='validation',
                     help='dataset split (default: validation)')
-parser.add_argument('--num-samples', default=None, type=int,
-                    metavar='N', help='Manually specify num samples in dataset split, for IterableDatasets.')
 parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
-parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
-                    help='path to class to idx mapping file (default: "")')
-parser.add_argument('--input-key', default=None, type=str,
-                   help='Dataset key for input images.')
-parser.add_argument('--input-img-mode', default=None, type=str,
-                   help='Dataset image conversion mode for input images.')
-parser.add_argument('--target-key', default=None, type=str,
-                   help='Dataset key for target labels.')
-
 parser.add_argument('--model', '-m', metavar='NAME', default='dpn92',
                     help='model architecture (default: dpn92)')
-parser.add_argument('--pretrained', dest='pretrained', action='store_true',
-                    help='use pre-trained model')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
+                    help='number of data loading workers (default: 2)')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('--img-size', default=None, type=int,
@@ -87,8 +86,6 @@ parser.add_argument('--crop-pct', default=None, type=float,
                     metavar='N', help='Input image center crop pct')
 parser.add_argument('--crop-mode', default=None, type=str,
                     metavar='N', help='Input image crop mode (squash, border, center). Model default if None.')
-parser.add_argument('--crop-border-pixels', type=int, default=None,
-                    help='Crop pixels from image border.')
 parser.add_argument('--mean', type=float, nargs='+', default=None, metavar='MEAN',
                     help='Override mean pixel value of dataset')
 parser.add_argument('--std', type=float,  nargs='+', default=None, metavar='STD',
@@ -97,12 +94,16 @@ parser.add_argument('--interpolation', default='', type=str, metavar='NAME',
                     help='Image resize interpolation type (overrides model)')
 parser.add_argument('--num-classes', type=int, default=None,
                     help='Number classes in dataset')
+parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
+                    help='path to class to idx mapping file (default: "")')
 parser.add_argument('--gp', default=None, type=str, metavar='POOL',
                     help='Global pool type, one of (fast, avg, max, avgmax, avgmaxc). Model default if None.')
 parser.add_argument('--log-freq', default=10, type=int,
                     metavar='N', help='batch logging frequency (default: 10)')
 parser.add_argument('--checkpoint', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--pretrained', dest='pretrained', action='store_true',
+                    help='use pre-trained model')
 parser.add_argument('--num-gpu', type=int, default=1,
                     help='Number of GPUS to use')
 parser.add_argument('--test-pool', dest='test_pool', action='store_true',
@@ -129,11 +130,8 @@ parser.add_argument('--fuser', default='', type=str,
                     help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 parser.add_argument('--fast-norm', default=False, action='store_true',
                     help='enable experimental fast-norm')
-parser.add_argument('--reparam', default=False, action='store_true',
-                    help='Reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
-parser.add_argument('--torchcompile-mode', type=str, default=None,
-                    help="torch.compile mode (default: None).")
+
 
 scripting_group = parser.add_mutually_exclusive_group()
 scripting_group.add_argument('--torchscript', default=False, action='store_true',
@@ -176,6 +174,7 @@ def validate(args):
             use_amp = 'apex'
             _logger.info('Validating in mixed precision with NVIDIA APEX AMP.')
         else:
+            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
             assert args.amp_dtype in ('float16', 'bfloat16')
             use_amp = 'native'
             amp_dtype = torch.bfloat16 if args.amp_dtype == 'bfloat16' else torch.float16
@@ -213,9 +212,6 @@ def validate(args):
     if args.checkpoint:
         load_checkpoint(model, args.checkpoint, args.use_ema)
 
-    if args.reparam:
-        model = reparameterize_model(model)
-
     param_count = sum([m.numel() for m in model.parameters()])
     _logger.info('Model %s created, param count: %d' % (args.model, param_count))
 
@@ -239,7 +235,7 @@ def validate(args):
     elif args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         torch._dynamo.reset()
-        model = torch.compile(model, backend=args.torchcompile, mode=args.torchcompile_mode)
+        model = torch.compile(model, backend=args.torchcompile)
     elif args.aot_autograd:
         assert has_functorch, "functorch is needed for --aot-autograd"
         model = memory_efficient_fusion(model)
@@ -253,10 +249,6 @@ def validate(args):
     criterion = nn.CrossEntropyLoss().to(device)
 
     root_dir = args.data or args.data_dir
-    if args.input_img_mode is None:
-        input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
-    else:
-        input_img_mode = args.input_img_mode
     dataset = create_dataset(
         root=root_dir,
         name=args.dataset,
@@ -264,15 +256,13 @@ def validate(args):
         download=args.dataset_download,
         load_bytes=args.tf_preprocessing,
         class_map=args.class_map,
-        num_samples=args.num_samples,
-        input_key=args.input_key,
-        input_img_mode=input_img_mode,
-        target_key=args.target_key,
+        train = False,
     )
 
     if args.valid_labels:
         with open(args.valid_labels, 'r') as f:
-            valid_labels = [int(line.rstrip()) for line in f]
+            valid_labels = {int(line.rstrip()) for line in f}
+            valid_labels = [i in valid_labels for i in range(args.num_classes)]
     else:
         valid_labels = None
 
@@ -293,7 +283,6 @@ def validate(args):
         num_workers=args.workers,
         crop_pct=crop_pct,
         crop_mode=data_config['crop_mode'],
-        crop_border_pixels=args.crop_border_pixels,
         pin_memory=args.pin_mem,
         device=device,
         tf_preprocessing=args.tf_preprocessing,
@@ -312,7 +301,15 @@ def validate(args):
             input = input.contiguous(memory_format=torch.channels_last)
         with amp_autocast():
             model(input)
+    
+        len_data = len(loader.dataset)
+        outputs = np.ones((len_data, 1010))
+        targets = np.ones((len_data, ))
+        counter = 0
 
+        logits_list = []
+        labels_list = []
+        print(str(str(args.model)))
         end = time.time()
         for batch_idx, (input, target) in enumerate(loader):
             if args.no_prefetcher:
@@ -338,6 +335,14 @@ def validate(args):
             top1.update(acc1.item(), input.size(0))
             top5.update(acc5.item(), input.size(0))
 
+            logits_list.append(output)
+            labels_list.append(target)
+
+            #print(output.shape)
+            outputs[counter:counter+input.shape[0],:] = output.softmax(dim=1).cpu().numpy() 
+            targets[counter:counter+target.shape[0]] = target.cpu().numpy().astype(int)
+            counter += input.shape[0]
+
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -358,6 +363,12 @@ def validate(args):
                         top5=top5
                     )
                 )
+        
+        logits = torch.cat(logits_list, dim=0).cuda() # n_examples, n_classes
+        labels = torch.cat(labels_list, dim=0).cuda() # n_classes, 
+
+    torch.save(logits, str(args.model)+'_logits.pt')
+    torch.save(labels, str(args.model) + '_labels.pt')
 
     if real_labels is not None:
         # real labels mode replaces topk values at the end
@@ -377,6 +388,17 @@ def validate(args):
     _logger.info(' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
        results['top1'], results['top1_err'], results['top5'], results['top5_err']))
 
+    np.savez(str(args.model)+'_outputs.npz', smx=outputs, labels = targets)
+    # try wity Guo's code
+    #ece_crit = utils.ECELoss().cuda()
+    #ece = ece_crit(logits, labels).item()
+    #print('Before temperature ECE: %.3f' % (ece))
+    # try with netcal lib 
+    #n_bins=15
+    #ece = ECE(n_bins)
+    #uncalibrated_score = ece.measure(F.softmax(logits, dim=1).cpu().numpy(), labels.cpu().numpy()) # expects softmax scores
+    #print('Netcal ECE: %.3f' % (uncalibrated_score))
+
     return results
 
 
@@ -387,10 +409,8 @@ def _try_run(args, initial_batch_size):
     while batch_size:
         args.batch_size = batch_size * args.num_gpu  # multiply by num-gpu for DataParallel case
         try:
-            if 'cuda' in args.device and torch.cuda.is_available():
+            if torch.cuda.is_available() and 'cuda' in args.device:
                 torch.cuda.empty_cache()
-            elif "npu" in args.device and torch.npu.is_available():
-                torch.npu.empty_cache()
             results = validate(args)
             return results
         except RuntimeError as e:
@@ -403,9 +423,6 @@ def _try_run(args, initial_batch_size):
     results['error'] = error_str
     _logger.error(f'{args.model} failed to validate ({error_str}).')
     return results
-
-
-_NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer']
 
 
 def main():
@@ -423,17 +440,11 @@ def main():
         if args.model == 'all':
             # validate all models in a list of names with pretrained checkpoints
             args.pretrained = True
-            model_names = list_models(
-                pretrained=True,
-                exclude_filters=_NON_IN1K_FILTERS,
-            )
+            model_names = list_models('convnext*', pretrained=True, exclude_filters=['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae'])
             model_cfgs = [(n, '') for n in model_names]
         elif not is_model(args.model):
             # model name doesn't exist, try as wildcard filter
-            model_names = list_models(
-                args.model,
-                pretrained=True,
-            )
+            model_names = list_models(args.model, pretrained=True)
             model_cfgs = [(n, '') for n in model_names]
 
         if not model_cfgs and os.path.isfile(args.model):

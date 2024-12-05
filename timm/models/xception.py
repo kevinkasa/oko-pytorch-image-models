@@ -27,9 +27,25 @@ import torch.nn.functional as F
 
 from timm.layers import create_classifier
 from ._builder import build_model_with_cfg
-from ._registry import register_model, generate_default_cfgs, register_model_deprecations
+from ._registry import register_model
 
 __all__ = ['Xception']
+
+default_cfgs = {
+    'xception': {
+        'url': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-cadene/xception-43020ad28.pth',
+        'input_size': (3, 299, 299),
+        'pool_size': (10, 10),
+        'crop_pct': 0.8975,
+        'interpolation': 'bicubic',
+        'mean': (0.5, 0.5, 0.5),
+        'std': (0.5, 0.5, 0.5),
+        'num_classes': 1000,
+        'first_conv': 'conv1',
+        'classifier': 'fc'
+        # The resize parameter of the validation transform should be 333, and make sure to center crop at 299x299
+    }
+}
 
 
 class SeparableConv2d(nn.Module):
@@ -105,7 +121,7 @@ class Xception(nn.Module):
         self.drop_rate = drop_rate
         self.global_pool = global_pool
         self.num_classes = num_classes
-        self.num_features = self.head_hidden_size = 2048
+        self.num_features = 2048
 
         self.conv1 = nn.Conv2d(in_chans, 32, 3, 2, 0, bias=False)
         self.bn1 = nn.BatchNorm2d(32)
@@ -171,10 +187,10 @@ class Xception(nn.Module):
         assert not enable, "gradient checkpointing not supported"
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool)
 
@@ -228,28 +244,6 @@ def _xception(variant, pretrained=False, **kwargs):
         **kwargs)
 
 
-default_cfgs = generate_default_cfgs({
-    'legacy_xception.tf_in1k': {
-        'url': 'https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-cadene/xception-43020ad28.pth',
-        'input_size': (3, 299, 299),
-        'pool_size': (10, 10),
-        'crop_pct': 0.8975,
-        'interpolation': 'bicubic',
-        'mean': (0.5, 0.5, 0.5),
-        'std': (0.5, 0.5, 0.5),
-        'num_classes': 1000,
-        'first_conv': 'conv1',
-        'classifier': 'fc'
-        # The resize parameter of the validation transform should be 333, and make sure to center crop at 299x299
-    }
-})
-
-
 @register_model
-def legacy_xception(pretrained=False, **kwargs) -> Xception:
-    return _xception('legacy_xception', pretrained=pretrained, **kwargs)
-
-
-register_model_deprecations(__name__, {
-    'xception': 'legacy_xception',
-})
+def xception(pretrained=False, **kwargs):
+    return _xception('xception', pretrained=pretrained, **kwargs)

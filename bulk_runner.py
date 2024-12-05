@@ -7,7 +7,7 @@ Benchmark all 'vit*' models:
 python bulk_runner.py  --model-list 'vit*' --results-file vit_bench.csv benchmark.py --amp -b 512
 
 Validate all models:
-python bulk_runner.py  --model-list all --results-file val.csv --pretrained validate.py --data-dir /imagenet/validation/ --amp -b 512 --retry
+python bulk_runner.py  --model-list all --results-file val.csv --pretrained validate.py /imagenet/validation/ --amp -b 512 --retry
 
 Hacked together by Ross Wightman (https://github.com/rwightman)
 """
@@ -21,7 +21,7 @@ import time
 from typing import Callable, List, Tuple, Union
 
 
-from timm.models import is_model, list_models, get_pretrained_cfg, get_arch_pretrained_cfgs
+from timm.models import is_model, list_models
 
 
 parser = argparse.ArgumentParser(description='Per-model process launcher')
@@ -93,67 +93,21 @@ def cmd_from_args(args) -> Tuple[Union[Callable, str], List[str]]:
     return cmd, cmd_args
 
 
-def _get_model_cfgs(
-        model_names,
-        num_classes=None,
-        expand_train_test=False,
-        include_crop=True,
-        expand_arch=False,
-):
-    model_cfgs = set()
-
-    for name in model_names:
-        if expand_arch:
-            pt_cfgs = get_arch_pretrained_cfgs(name).values()
-        else:
-            pt_cfg = get_pretrained_cfg(name)
-            pt_cfgs = [pt_cfg] if pt_cfg is not None else []
-
-        for cfg in pt_cfgs:
-            if cfg.input_size is None:
-                continue
-            if num_classes is not None and getattr(cfg, 'num_classes', 0) != num_classes:
-                continue
-
-            # Add main configuration
-            size = cfg.input_size[-1]
-            if include_crop:
-                model_cfgs.add((name, size, cfg.crop_pct))
-            else:
-                model_cfgs.add((name, size))
-
-            # Add test configuration if required
-            if expand_train_test and cfg.test_input_size is not None:
-                test_size = cfg.test_input_size[-1]
-                if include_crop:
-                    test_crop = cfg.test_crop_pct or cfg.crop_pct
-                    model_cfgs.add((name, test_size, test_crop))
-                else:
-                    model_cfgs.add((name, test_size))
-
-    # Format the output
-    if include_crop:
-        return [(n, {'img-size': r, 'crop-pct': cp}) for n, r, cp in sorted(model_cfgs)]
-    else:
-        return [(n, {'img-size': r}) for n, r in sorted(model_cfgs)]
-
-
 def main():
     args = parser.parse_args()
     cmd, cmd_args = cmd_from_args(args)
 
     model_cfgs = []
+    model_names = []
     if args.model_list == 'all':
+        # NOTE should make this config, for validation / benchmark runs the focus is 1k models,
+        # so we filter out 21/22k and some other unusable heads. This will change in the future...
+        exclude_model_filters = ['*in21k', '*in22k', '*dino', '*_22k']
         model_names = list_models(
             pretrained=args.pretrained,  # only include models w/ pretrained checkpoints if set
+            exclude_filters=exclude_model_filters
         )
         model_cfgs = [(n, None) for n in model_names]
-    elif args.model_list == 'all_in1k':
-        model_names = list_models(pretrained=True)
-        model_cfgs = _get_model_cfgs(model_names, num_classes=1000, expand_train_test=True)
-    elif args.model_list == 'all_res':
-        model_names = list_models()
-        model_cfgs = _get_model_cfgs(model_names, expand_train_test=True, include_crop=False, expand_arch=True)
     elif not is_model(args.model_list):
         # model name doesn't exist, try as wildcard filter
         model_names = list_models(args.model_list)
@@ -162,19 +116,13 @@ def main():
     if not model_cfgs and os.path.exists(args.model_list):
         with open(args.model_list) as f:
             model_names = [line.rstrip() for line in f]
-            model_cfgs = _get_model_cfgs(
-                model_names,
-                #num_classes=1000,
-                expand_train_test=True,
-                #include_crop=False,
-            )
+            model_cfgs = [(n, None) for n in model_names]
 
     if len(model_cfgs):
         results_file = args.results_file or './results.csv'
         results = []
         errors = []
-        model_strings = '\n'.join([f'{x[0]}, {x[1]}' for x in model_cfgs])
-        print(f"Running script on these models:\n {model_strings}")
+        print('Running script on these models: {}'.format(', '.join(model_names)))
         if not args.sort_key:
             if 'benchmark' in args.script:
                 if any(['train' in a for a in args.script_args]):
@@ -188,14 +136,10 @@ def main():
         print(f'Script: {args.script}, Args: {args.script_args}, Sort key: {sort_key}')
 
         try:
-            for m, ax in model_cfgs:
+            for m, _ in model_cfgs:
                 if not m:
                     continue
                 args_str = (cmd, *[str(e) for e in cmd_args], '--model', m)
-                if ax is not None:
-                    extra_args = [(f'--{k}', str(v)) for k, v in ax.items()]
-                    extra_args = [i for t in extra_args for i in t]
-                    args_str += tuple(extra_args)
                 try:
                     o = subprocess.check_output(args=args_str).decode('utf-8').split('--result')[-1]
                     r = json.loads(o)
@@ -213,11 +157,7 @@ def main():
         if errors:
             print(f'{len(errors)} models had errors during run.')
             for e in errors:
-                if 'model' in e:
-                    print(f"\t {e['model']} ({e.get('error', 'Unknown')})")
-                else:
-                    print(e)
-
+                print(f"\t {e['model']} ({e.get('error', 'Unknown')})")
         results = list(filter(lambda x: 'error' not in x, results))
 
         no_sortkey = list(filter(lambda x: sort_key not in x, results))

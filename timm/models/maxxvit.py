@@ -42,18 +42,17 @@ from typing import Callable, Optional, Union, Tuple, List
 
 import torch
 from torch import nn
-from torch.jit import Final
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import Mlp, ConvMlp, DropPath, LayerNorm, ClassifierHead, NormMlpClassifierHead
 from timm.layers import create_attn, get_act_layer, get_norm_layer, get_norm_act_layer, create_conv2d, create_pool2d
 from timm.layers import trunc_normal_tf_, to_2tuple, extend_tuple, make_divisible, _assert
-from timm.layers import RelPosMlp, RelPosBias, RelPosBiasTf, use_fused_attn, resize_rel_pos_bias_table
+from timm.layers import RelPosMlp, RelPosBias, RelPosBiasTf
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
 from ._manipulate import named_apply, checkpoint_seq
-from ._registry import generate_default_cfgs, register_model
+from ._pretrained import generate_default_cfgs
+from ._registry import register_model
 
 __all__ = ['MaxxVitCfg', 'MaxxVitConvCfg', 'MaxxVitTransformerCfg', 'MaxxVit']
 
@@ -141,8 +140,6 @@ class MaxxVitCfg:
 
 
 class Attention2d(nn.Module):
-    fused_attn: Final[bool]
-
     """ multi-head attention for 2D NCHW tensors"""
     def __init__(
             self,
@@ -163,7 +160,6 @@ class Attention2d(nn.Module):
         self.dim_head = dim_head
         self.head_first = head_first
         self.scale = dim_head ** -0.5
-        self.fused_attn = use_fused_attn()
 
         self.qkv = nn.Conv2d(dim, dim_attn * 3, 1, bias=bias)
         self.rel_pos = rel_pos_cls(num_heads=self.num_heads) if rel_pos_cls else None
@@ -179,31 +175,15 @@ class Attention2d(nn.Module):
         else:
             q, k, v = self.qkv(x).reshape(B, 3, self.num_heads, self.dim_head, -1).unbind(1)
 
-        if self.fused_attn:
-            attn_bias = None
-            if self.rel_pos is not None:
-                attn_bias = self.rel_pos.get_bias()
-            elif shared_rel_pos is not None:
-                attn_bias = shared_rel_pos
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        if self.rel_pos is not None:
+            attn = self.rel_pos(attn)
+        elif shared_rel_pos is not None:
+            attn = attn + shared_rel_pos
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-            x = torch.nn.functional.scaled_dot_product_attention(
-                q.transpose(-1, -2).contiguous(),
-                k.transpose(-1, -2).contiguous(),
-                v.transpose(-1, -2).contiguous(),
-                attn_mask=attn_bias,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            ).transpose(-1, -2).reshape(B, -1, H, W)
-        else:
-            q = q * self.scale
-            attn = q.transpose(-2, -1) @ k
-            if self.rel_pos is not None:
-                attn = self.rel_pos(attn)
-            elif shared_rel_pos is not None:
-                attn = attn + shared_rel_pos
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W)
-
+        x = (v @ attn.transpose(-2, -1)).view(B, -1, H, W)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -211,8 +191,6 @@ class Attention2d(nn.Module):
 
 class AttentionCl(nn.Module):
     """ Channels-last multi-head attention (B, ..., C) """
-    fused_attn: Final[bool]
-
     def __init__(
             self,
             dim: int,
@@ -233,7 +211,6 @@ class AttentionCl(nn.Module):
         self.dim_head = dim_head
         self.head_first = head_first
         self.scale = dim_head ** -0.5
-        self.fused_attn = use_fused_attn()
 
         self.qkv = nn.Linear(dim, dim_attn * 3, bias=bias)
         self.rel_pos = rel_pos_cls(num_heads=self.num_heads) if rel_pos_cls else None
@@ -250,30 +227,15 @@ class AttentionCl(nn.Module):
         else:
             q, k, v = self.qkv(x).reshape(B, -1, 3, self.num_heads, self.dim_head).transpose(1, 3).unbind(2)
 
-        if self.fused_attn:
-            attn_bias = None
-            if self.rel_pos is not None:
-                attn_bias = self.rel_pos.get_bias()
-            elif shared_rel_pos is not None:
-                attn_bias = shared_rel_pos
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if self.rel_pos is not None:
+            attn = self.rel_pos(attn, shared_rel_pos=shared_rel_pos)
+        elif shared_rel_pos is not None:
+            attn = attn + shared_rel_pos
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-            x = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_bias,
-                dropout_p=self.attn_drop.p if self.training else 0.,
-            )
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            if self.rel_pos is not None:
-                attn = self.rel_pos(attn, shared_rel_pos=shared_rel_pos)
-            elif shared_rel_pos is not None:
-                attn = attn + shared_rel_pos
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-        x = x.transpose(1, 2).reshape(restore_shape + (-1,))
+        x = (attn @ v).transpose(1, 2).reshape(restore_shape + (-1,))
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -633,7 +595,7 @@ class ConvNeXtBlock(nn.Module):
 def window_partition(x, window_size: List[int]):
     B, H, W, C = x.shape
     _assert(H % window_size[0] == 0, f'height ({H}) must be divisible by window ({window_size[0]})')
-    _assert(W % window_size[1] == 0, f'width ({W}) must be divisible by window ({window_size[1]})')
+    _assert(W % window_size[1] == 0, '')
     x = x.view(B, H // window_size[0], window_size[0], W // window_size[1], window_size[1], C)
     windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size[0], window_size[1], C)
     return windows
@@ -651,7 +613,7 @@ def window_reverse(windows, window_size: List[int], img_size: List[int]):
 def grid_partition(x, grid_size: List[int]):
     B, H, W, C = x.shape
     _assert(H % grid_size[0] == 0, f'height {H} must be divisible by grid {grid_size[0]}')
-    _assert(W % grid_size[1] == 0, f'width {W} must be divisible by grid {grid_size[1]}')
+    _assert(W % grid_size[1] == 0, '')
     x = x.view(B, grid_size[0], H // grid_size[0], grid_size[1], W // grid_size[1], C)
     windows = x.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, grid_size[0], grid_size[1], C)
     return windows
@@ -817,7 +779,7 @@ class ParallelPartitionAttention(nn.Module):
 def window_partition_nchw(x, window_size: List[int]):
     B, C, H, W = x.shape
     _assert(H % window_size[0] == 0, f'height ({H}) must be divisible by window ({window_size[0]})')
-    _assert(W % window_size[1] == 0, f'width ({W}) must be divisible by window ({window_size[1]})')
+    _assert(W % window_size[1] == 0, '')
     x = x.view(B, C, H // window_size[0], window_size[0], W // window_size[1], window_size[1])
     windows = x.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, C, window_size[0], window_size[1])
     return windows
@@ -835,7 +797,7 @@ def window_reverse_nchw(windows, window_size: List[int], img_size: List[int]):
 def grid_partition_nchw(x, grid_size: List[int]):
     B, C, H, W = x.shape
     _assert(H % grid_size[0] == 0, f'height {H} must be divisible by grid {grid_size[0]}')
-    _assert(W % grid_size[1] == 0, f'width {W} must be divisible by grid {grid_size[1]}')
+    _assert(W % grid_size[1] == 0, '')
     x = x.view(B, C, grid_size[0], H // grid_size[0], grid_size[1], W // grid_size[1])
     windows = x.permute(0, 3, 5, 1, 2, 4).contiguous().view(-1, C, grid_size[0], grid_size[1])
     return windows
@@ -1197,9 +1159,9 @@ class MaxxVit(nn.Module):
         self.stages = nn.Sequential(*stages)
 
         final_norm_layer = partial(get_norm_layer(cfg.transformer_cfg.norm_layer), eps=cfg.transformer_cfg.norm_eps)
-        if cfg.head_hidden_size:
+        self.head_hidden_size = cfg.head_hidden_size
+        if self.head_hidden_size:
             self.norm = nn.Identity()
-            self.head_hidden_size = cfg.head_hidden_size
             self.head = NormMlpClassifierHead(
                 self.num_features,
                 num_classes,
@@ -1210,7 +1172,6 @@ class MaxxVit(nn.Module):
             )
         else:
             # standard classifier head w/ norm, pooling, fc classifier
-            self.head_hidden_size = self.num_features
             self.norm = final_norm_layer(self.num_features)
             self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate)
 
@@ -1246,81 +1207,12 @@ class MaxxVit(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         self.head.reset(num_classes, global_pool)
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            norm: Apply norm layer to compatible intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
-
-        """
-        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.stages) + 1, indices)
-
-        # forward pass
-        feat_idx = 0  # stem is index 0
-        x = self.stem(x)
-        if feat_idx in take_indices:
-            intermediates.append(x)
-
-        last_idx = len(self.stages)
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
-            stages = self.stages
-        else:
-            stages = self.stages[:max_index]
-        for stage in stages:
-            feat_idx += 1
-            x = stage(x)
-            if feat_idx in take_indices:
-                if norm and feat_idx == last_idx:
-                    x_inter = self.norm(x)  # applying final norm to last intermediate
-                else:
-                    x_inter = x
-                intermediates.append(x_inter)
-
-        if intermediates_only:
-            return intermediates
-
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.stages) + 1, indices)
-        self.stages = self.stages[:max_index]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.head = self.reset_classifier(0, '')
-        return take_indices
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -1329,7 +1221,7 @@ class MaxxVit(nn.Module):
         return x
 
     def forward_head(self, x, pre_logits: bool = False):
-        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
+        return self.head(x, pre_logits=pre_logits)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -1861,15 +1753,6 @@ def checkpoint_filter_fn(state_dict, model: nn.Module):
     model_state_dict = model.state_dict()
     out_dict = {}
     for k, v in state_dict.items():
-        if k.endswith('relative_position_bias_table'):
-            m = model.get_submodule(k[:-29])
-            if v.shape != m.relative_position_bias_table.shape or m.window_size[0] != m.window_size[1]:
-                v = resize_rel_pos_bias_table(
-                    v,
-                    new_window_size=m.window_size,
-                    new_bias_shape=m.relative_position_bias_table.shape,
-                )
-
         if k in model_state_dict and v.ndim != model_state_dict[k].ndim and v.numel() == model_state_dict[k].numel():
             # adapt between conv2d / linear layers
             assert v.ndim in (2, 4)
@@ -2093,8 +1976,7 @@ default_cfgs = generate_default_cfgs({
         input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
 
     'maxvit_base_tf_224.in21k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=21843),
+        url=''),
     'maxvit_base_tf_384.in21k_ft_in1k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
@@ -2102,8 +1984,7 @@ default_cfgs = generate_default_cfgs({
         hf_hub_id='timm/',
         input_size=(3, 512, 512), pool_size=(16, 16), crop_pct=1.0, crop_mode='squash'),
     'maxvit_large_tf_224.in21k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=21843),
+        url=''),
     'maxvit_large_tf_384.in21k_ft_in1k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
@@ -2111,8 +1992,7 @@ default_cfgs = generate_default_cfgs({
         hf_hub_id='timm/',
         input_size=(3, 512, 512), crop_pct=1.0, crop_mode='squash'),
     'maxvit_xlarge_tf_224.in21k': _cfg(
-        hf_hub_id='timm/',
-        num_classes=21843),
+        url=''),
     'maxvit_xlarge_tf_384.in21k_ft_in1k': _cfg(
         hf_hub_id='timm/',
         input_size=(3, 384, 384), pool_size=(12, 12), crop_pct=1.0, crop_mode='squash'),
@@ -2123,280 +2003,280 @@ default_cfgs = generate_default_cfgs({
 
 
 @register_model
-def coatnet_pico_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_pico_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_pico_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_nano_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_nano_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_nano_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_0_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_0_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_0_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_1_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_1_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_1_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_2_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_2_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_2_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_3_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_3_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_3_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_bn_0_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_bn_0_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_bn_0_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_nano_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_nano_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_nano_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_0_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_0_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_0_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_1_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_1_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_1_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_1_rw2_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_1_rw2_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_1_rw2_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_2_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_2_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_2_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_2_rw_384(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_2_rw_384(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_2_rw_384', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_rmlp_3_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_rmlp_3_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_rmlp_3_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_nano_cc_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_nano_cc_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_nano_cc_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnext_nano_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnext_nano_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnext_nano_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_0_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_0_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_0_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_1_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_1_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_1_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_2_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_2_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_2_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_3_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_3_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_3_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_4_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_4_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_4_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def coatnet_5_224(pretrained=False, **kwargs) -> MaxxVit:
+def coatnet_5_224(pretrained=False, **kwargs):
     return _create_maxxvit('coatnet_5_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_pico_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_pico_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_pico_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_nano_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_nano_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_nano_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_pico_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_pico_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_pico_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_nano_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_nano_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_nano_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_tiny_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_tiny_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_tiny_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_small_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_small_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_small_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_small_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_small_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_small_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_base_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_base_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_base_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_rmlp_base_rw_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_rmlp_base_rw_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_rmlp_base_rw_384', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_pm_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_pm_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_pm_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvit_rmlp_nano_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvit_rmlp_nano_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvit_rmlp_nano_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvit_rmlp_tiny_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvit_rmlp_tiny_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvit_rmlp_tiny_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvit_rmlp_small_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvit_rmlp_small_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvit_rmlp_small_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvitv2_nano_rw_256(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvitv2_nano_rw_256(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvitv2_nano_rw_256', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvitv2_rmlp_base_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvitv2_rmlp_base_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvitv2_rmlp_base_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvitv2_rmlp_base_rw_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvitv2_rmlp_base_rw_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvitv2_rmlp_base_rw_384', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxxvitv2_rmlp_large_rw_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxxvitv2_rmlp_large_rw_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxxvitv2_rmlp_large_rw_224', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_tf_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_tf_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_tf_224', 'maxvit_tiny_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_tf_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_tf_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_tf_384', 'maxvit_tiny_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_tiny_tf_512(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_tiny_tf_512(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_tiny_tf_512', 'maxvit_tiny_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_small_tf_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_small_tf_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_small_tf_224', 'maxvit_small_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_small_tf_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_small_tf_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_small_tf_384', 'maxvit_small_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_small_tf_512(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_small_tf_512(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_small_tf_512', 'maxvit_small_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_base_tf_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_base_tf_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_base_tf_224', 'maxvit_base_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_base_tf_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_base_tf_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_base_tf_384', 'maxvit_base_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_base_tf_512(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_base_tf_512(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_base_tf_512', 'maxvit_base_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_large_tf_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_large_tf_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_large_tf_224', 'maxvit_large_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_large_tf_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_large_tf_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_large_tf_384', 'maxvit_large_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_large_tf_512(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_large_tf_512(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_large_tf_512', 'maxvit_large_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_xlarge_tf_224(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_xlarge_tf_224(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_xlarge_tf_224', 'maxvit_xlarge_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_xlarge_tf_384(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_xlarge_tf_384(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_xlarge_tf_384', 'maxvit_xlarge_tf', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def maxvit_xlarge_tf_512(pretrained=False, **kwargs) -> MaxxVit:
+def maxvit_xlarge_tf_512(pretrained=False, **kwargs):
     return _create_maxxvit('maxvit_xlarge_tf_512', 'maxvit_xlarge_tf', pretrained=pretrained, **kwargs)

@@ -26,11 +26,42 @@ from torch import nn
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import Mlp, DropPath, trunc_normal_tf_, get_norm_layer, to_2tuple
 from ._builder import build_model_with_cfg
-from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
-from ._registry import register_model, register_model_deprecations, generate_default_cfgs
+from ._registry import register_model
 
 __all__ = ['MultiScaleVit', 'MultiScaleVitCfg']  # model_registry will add each entrypoint fn to this
+
+
+def _cfg(url='', **kwargs):
+    return {
+        'url': url,
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
+        'crop_pct': .9, 'interpolation': 'bicubic',
+        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
+        'first_conv': 'patch_embed.proj', 'classifier': 'head.fc',
+        'fixed_input_size': True,
+        **kwargs
+    }
+
+
+default_cfgs = dict(
+    mvitv2_tiny=_cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_T_in1k.pyth'),
+    mvitv2_small=_cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_S_in1k.pyth'),
+    mvitv2_base=_cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_B_in1k.pyth'),
+    mvitv2_large=_cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_L_in1k.pyth'),
+
+    mvitv2_base_in21k=_cfg(
+        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_B_in21k.pyth',
+        num_classes=19168),
+    mvitv2_large_in21k=_cfg(
+        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_L_in21k.pyth',
+        num_classes=19168),
+    mvitv2_huge_in21k=_cfg(
+        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_H_in21k.pyth',
+        num_classes=19168),
+
+    mvitv2_small_cls=_cfg(url=''),
+)
 
 
 @dataclass
@@ -80,6 +111,40 @@ class MultiScaleVitCfg:
                     ]
                 pool_kv_stride.append(tuple(_stride_kv))
             self.stride_kv = tuple(pool_kv_stride)
+
+
+model_cfgs = dict(
+    mvitv2_tiny=MultiScaleVitCfg(
+        depths=(1, 2, 5, 2),
+    ),
+    mvitv2_small=MultiScaleVitCfg(
+        depths=(1, 2, 11, 2),
+    ),
+    mvitv2_base=MultiScaleVitCfg(
+        depths=(2, 3, 16, 3),
+    ),
+    mvitv2_large=MultiScaleVitCfg(
+        depths=(2, 6, 36, 4),
+        embed_dim=144,
+        num_heads=2,
+        expand_attn=False,
+    ),
+
+    mvitv2_base_in21k=MultiScaleVitCfg(
+        depths=(2, 3, 16, 3),
+    ),
+    mvitv2_large_in21k=MultiScaleVitCfg(
+        depths=(2, 6, 36, 4),
+        embed_dim=144,
+        num_heads=2,
+        expand_attn=False,
+    ),
+
+    mvitv2_small_cls=MultiScaleVitCfg(
+        depths=(1, 2, 11, 2),
+        use_cls_token=True,
+    ),
+)
 
 
 def prod(iterable):
@@ -164,32 +229,26 @@ def cal_rel_pos_type(
     # Scale up rel pos if shapes for q and k are different.
     q_h_ratio = max(k_h / q_h, 1.0)
     k_h_ratio = max(q_h / k_h, 1.0)
-    dist_h = (
-            torch.arange(q_h, device=q.device).unsqueeze(-1) * q_h_ratio -
-            torch.arange(k_h, device=q.device).unsqueeze(0) * k_h_ratio
-    )
+    dist_h = torch.arange(q_h)[:, None] * q_h_ratio - torch.arange(k_h)[None, :] * k_h_ratio
     dist_h += (k_h - 1) * k_h_ratio
     q_w_ratio = max(k_w / q_w, 1.0)
     k_w_ratio = max(q_w / k_w, 1.0)
-    dist_w = (
-            torch.arange(q_w, device=q.device).unsqueeze(-1) * q_w_ratio -
-            torch.arange(k_w, device=q.device).unsqueeze(0) * k_w_ratio
-    )
+    dist_w = torch.arange(q_w)[:, None] * q_w_ratio - torch.arange(k_w)[None, :] * k_w_ratio
     dist_w += (k_w - 1) * k_w_ratio
 
-    rel_h = rel_pos_h[dist_h.long()]
-    rel_w = rel_pos_w[dist_w.long()]
+    Rh = rel_pos_h[dist_h.long()]
+    Rw = rel_pos_w[dist_w.long()]
 
     B, n_head, q_N, dim = q.shape
 
     r_q = q[:, :, sp_idx:].reshape(B, n_head, q_h, q_w, dim)
-    rel_h = torch.einsum("byhwc,hkc->byhwk", r_q, rel_h)
-    rel_w = torch.einsum("byhwc,wkc->byhwk", r_q, rel_w)
+    rel_h = torch.einsum("byhwc,hkc->byhwk", r_q, Rh)
+    rel_w = torch.einsum("byhwc,wkc->byhwk", r_q, Rw)
 
     attn[:, :, sp_idx:, sp_idx:] = (
         attn[:, :, sp_idx:, sp_idx:].view(B, -1, q_h, q_w, k_h, k_w)
-        + rel_h.unsqueeze(-1)
-        + rel_w.unsqueeze(-2)
+        + rel_h[:, :, :, :, :, None]
+        + rel_w[:, :, :, :, None, :]
     ).view(B, -1, q_h * q_w, k_h * k_w)
 
     return attn
@@ -331,18 +390,18 @@ class MultiScaleAttentionPoolFirst(nn.Module):
             v = self.norm_v(v)
 
         q_N = q_size[0] * q_size[1] + int(self.has_cls_token)
-        q = q.transpose(1, 2).reshape(B, q_N, -1)
-        q = self.q(q).reshape(B, q_N, self.num_heads, -1).transpose(1, 2)
+        q = q.permute(0, 2, 1, 3).reshape(B, q_N, -1)
+        q = self.q(q).reshape(B, q_N, self.num_heads, -1).permute(0, 2, 1, 3)
 
         k_N = k_size[0] * k_size[1] + int(self.has_cls_token)
-        k = k.transpose(1, 2).reshape(B, k_N, -1)
-        k = self.k(k).reshape(B, k_N, self.num_heads, -1)
+        k = k.permute(0, 2, 1, 3).reshape(B, k_N, -1)
+        k = self.k(k).reshape(B, k_N, self.num_heads, -1).permute(0, 2, 1, 3)
 
         v_N = v_size[0] * v_size[1] + int(self.has_cls_token)
-        v = v.transpose(1, 2).reshape(B, v_N, -1)
-        v = self.v(v).reshape(B, v_N, self.num_heads, -1).transpose(1, 2)
+        v = v.permute(0, 2, 1, 3).reshape(B, v_N, -1)
+        v = self.v(v).reshape(B, v_N, self.num_heads, -1).permute(0, 2, 1, 3)
 
-        attn = (q * self.scale) @ k
+        attn = (q * self.scale) @ k.transpose(-2, -1)
         if self.rel_pos_type == 'spatial':
             attn = cal_rel_pos_type(
                 attn,
@@ -705,7 +764,7 @@ class MultiScaleVit(nn.Module):
             cfg: MultiScaleVitCfg,
             img_size: Tuple[int, int] = (224, 224),
             in_chans: int = 3,
-            global_pool: Optional[str] = None,
+            global_pool: str = 'avg',
             num_classes: int = 1000,
             drop_path_rate: float = 0.,
             drop_rate: float = 0.,
@@ -715,8 +774,6 @@ class MultiScaleVit(nn.Module):
         norm_layer = partial(get_norm_layer(cfg.norm_layer), eps=cfg.norm_eps)
         self.num_classes = num_classes
         self.drop_rate = drop_rate
-        if global_pool is None:
-            global_pool = 'token' if cfg.use_cls_token else 'avg'
         self.global_pool = global_pool
         self.depths = tuple(cfg.depths)
         self.expand_attn = cfg.expand_attn
@@ -748,10 +805,8 @@ class MultiScaleVit(nn.Module):
 
         num_stages = len(cfg.embed_dim)
         feat_size = patch_dims
-        curr_stride = max(cfg.patch_stride)
         dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(cfg.depths)).split(cfg.depths)]
         self.stages = nn.ModuleList()
-        self.feature_info = []
         for i in range(num_stages):
             if cfg.expand_attn:
                 dim_out = cfg.embed_dim[i]
@@ -778,13 +833,11 @@ class MultiScaleVit(nn.Module):
                 norm_layer=norm_layer,
                 drop_path=dpr[i],
             )
-            curr_stride *= max(cfg.stride_q[i])
-            self.feature_info += [dict(module=f'block.{i}', num_chs=dim_out, reduction=curr_stride)]
             embed_dim = dim_out
             feat_size = stage.feat_size
             self.stages.append(stage)
 
-        self.num_features = self.head_hidden_size = embed_dim
+        self.num_features = embed_dim
         self.norm = norm_layer(embed_dim)
         self.head = nn.Sequential(OrderedDict([
             ('drop', nn.Dropout(self.drop_rate)),
@@ -822,10 +875,10 @@ class MultiScaleVit(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes, global_pool=None):
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
@@ -833,80 +886,6 @@ class MultiScaleVit(nn.Module):
             ('drop', nn.Dropout(self.drop_rate)),
             ('fc', nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity())
         ]))
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            norm: bool = False,
-            stop_early: bool = False,
-            output_fmt: str = 'NCHW',
-            intermediates_only: bool = False,
-    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            norm: Apply norm layer to all intermediates
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            output_fmt: Shape of intermediate feature outputs
-            intermediates_only: Only return intermediate features
-        Returns:
-
-        """
-        assert output_fmt in ('NCHW', 'NLC'), 'Output shape must be NCHW or NLC.'
-        reshape = output_fmt == 'NCHW'
-        intermediates = []
-        take_indices, max_index = feature_take_indices(len(self.stages), indices)
-
-        # FIXME slice block/pos_block if < max
-        # forward pass
-        x, feat_size = self.patch_embed(x)
-        B = x.shape[0]
-        if self.cls_token is not None:
-            cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-        if self.pos_embed is not None:
-            x = x + self.pos_embed
-
-        for i, stage in enumerate(self.stages):
-            x, feat_size = stage(x, feat_size)
-            if i in take_indices:
-                if norm and i == (len(self.stages) - 1):
-                    x_inter = self.norm(x)  # applying final norm last intermediate
-                else:
-                    x_inter = x
-                if reshape:
-                    if self.cls_token is not None:
-                        # possible to allow return of class tokens, TBD
-                        x_inter = x_inter[:, 1:]
-                    x_inter = x_inter.reshape(B, feat_size[0], feat_size[1], -1).permute(0, 3, 1, 2)
-                intermediates.append(x_inter)
-
-        if intermediates_only:
-            return intermediates
-
-        x = self.norm(x)
-
-        return x, intermediates
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices, max_index = feature_take_indices(len(self.stages), indices)
-        # FIXME add stage pruning
-        # self.stages = self.stages[:max_index]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
-            self.reset_classifier(0, '')
-        return take_indices
 
     def forward_features(self, x):
         x, feat_size = self.patch_embed(x)
@@ -941,18 +920,6 @@ class MultiScaleVit(nn.Module):
 
 def checkpoint_filter_fn(state_dict, model):
     if 'stages.0.blocks.0.norm1.weight' in state_dict:
-        # native checkpoint, look for rel_pos interpolations
-        for k in state_dict.keys():
-            if 'rel_pos' in k:
-                rel_pos = state_dict[k]
-                dest_rel_pos_shape = model.state_dict()[k].shape
-                if rel_pos.shape[0] != dest_rel_pos_shape[0]:
-                    rel_pos_resized = torch.nn.functional.interpolate(
-                        rel_pos.reshape(1, rel_pos.shape[0], -1).permute(0, 2, 1),
-                        size=dest_rel_pos_shape[0],
-                        mode="linear",
-                    )
-                    state_dict[k] = rel_pos_resized.reshape(-1, dest_rel_pos_shape[0]).permute(1, 0)
         return state_dict
 
     import re
@@ -983,138 +950,63 @@ def checkpoint_filter_fn(state_dict, model):
             k = k.replace('head.projection', 'head.fc')
         out_dict[k] = v
 
+    # for k, v in state_dict.items():
+    #     if model.pos_embed is not None and k == 'pos_embed' and v.shape[1] != model.pos_embed.shape[1]:
+    #         # To resize pos embedding when using model at different size from pretrained weights
+    #         v = resize_pos_embed(
+    #             v,
+    #             model.pos_embed,
+    #             0 if getattr(model, 'no_embed_class') else getattr(model, 'num_prefix_tokens', 1),
+    #             model.patch_embed.grid_size
+    #         )
+
     return out_dict
 
 
-model_cfgs = dict(
-    mvitv2_tiny=MultiScaleVitCfg(
-        depths=(1, 2, 5, 2),
-    ),
-    mvitv2_small=MultiScaleVitCfg(
-        depths=(1, 2, 11, 2),
-    ),
-    mvitv2_base=MultiScaleVitCfg(
-        depths=(2, 3, 16, 3),
-    ),
-    mvitv2_large=MultiScaleVitCfg(
-        depths=(2, 6, 36, 4),
-        embed_dim=144,
-        num_heads=2,
-        expand_attn=False,
-    ),
-
-    mvitv2_small_cls=MultiScaleVitCfg(
-        depths=(1, 2, 11, 2),
-        use_cls_token=True,
-    ),
-    mvitv2_base_cls=MultiScaleVitCfg(
-        depths=(2, 3, 16, 3),
-        use_cls_token=True,
-    ),
-    mvitv2_large_cls=MultiScaleVitCfg(
-        depths=(2, 6, 36, 4),
-        embed_dim=144,
-        num_heads=2,
-        use_cls_token=True,
-        expand_attn=True,
-    ),
-    mvitv2_huge_cls=MultiScaleVitCfg(
-        depths=(4, 8, 60, 8),
-        embed_dim=192,
-        num_heads=3,
-        use_cls_token=True,
-        expand_attn=True,
-    ),
-)
-
-
 def _create_mvitv2(variant, cfg_variant=None, pretrained=False, **kwargs):
-    out_indices = kwargs.pop('out_indices', 4)
     return build_model_with_cfg(
-        MultiScaleVit,
-        variant,
-        pretrained,
+        MultiScaleVit, variant, pretrained,
         model_cfg=model_cfgs[variant] if not cfg_variant else model_cfgs[cfg_variant],
         pretrained_filter_fn=checkpoint_filter_fn,
-        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
-        **kwargs,
-    )
-
-
-def _cfg(url='', **kwargs):
-    return {
-        'url': url,
-        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
-        'crop_pct': .9, 'interpolation': 'bicubic',
-        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'patch_embed.proj', 'classifier': 'head.fc',
-        'fixed_input_size': True,
-        **kwargs
-    }
-
-
-default_cfgs = generate_default_cfgs({
-    'mvitv2_tiny.fb_in1k': _cfg(
-        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_T_in1k.pyth',
-        hf_hub_id='timm/'),
-    'mvitv2_small.fb_in1k': _cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_S_in1k.pyth',
-        hf_hub_id='timm/'),
-    'mvitv2_base.fb_in1k': _cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_B_in1k.pyth',
-        hf_hub_id='timm/'),
-    'mvitv2_large.fb_in1k': _cfg(url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_L_in1k.pyth',
-        hf_hub_id='timm/'),
-
-    'mvitv2_small_cls': _cfg(url=''),
-    'mvitv2_base_cls.fb_inw21k': _cfg(
-        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_B_in21k.pyth',
-        hf_hub_id='timm/',
-        num_classes=19168),
-    'mvitv2_large_cls.fb_inw21k': _cfg(
-        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_L_in21k.pyth',
-        hf_hub_id='timm/',
-        num_classes=19168),
-    'mvitv2_huge_cls.fb_inw21k': _cfg(
-        url='https://dl.fbaipublicfiles.com/mvit/mvitv2_models/MViTv2_H_in21k.pyth',
-        hf_hub_id='timm/',
-        num_classes=19168),
-})
+        feature_cfg=dict(flatten_sequential=True),
+        **kwargs)
 
 
 @register_model
-def mvitv2_tiny(pretrained=False, **kwargs) -> MultiScaleVit:
+def mvitv2_tiny(pretrained=False, **kwargs):
     return _create_mvitv2('mvitv2_tiny', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def mvitv2_small(pretrained=False, **kwargs) -> MultiScaleVit:
+def mvitv2_small(pretrained=False, **kwargs):
     return _create_mvitv2('mvitv2_small', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def mvitv2_base(pretrained=False, **kwargs) -> MultiScaleVit:
+def mvitv2_base(pretrained=False, **kwargs):
     return _create_mvitv2('mvitv2_base', pretrained=pretrained, **kwargs)
 
 
 @register_model
-def mvitv2_large(pretrained=False, **kwargs) -> MultiScaleVit:
+def mvitv2_large(pretrained=False, **kwargs):
     return _create_mvitv2('mvitv2_large', pretrained=pretrained, **kwargs)
 
 
+# @register_model
+# def mvitv2_base_in21k(pretrained=False, **kwargs):
+#     return _create_mvitv2('mvitv2_base_in21k', pretrained=pretrained, **kwargs)
+#
+#
+# @register_model
+# def mvitv2_large_in21k(pretrained=False, **kwargs):
+#     return _create_mvitv2('mvitv2_large_in21k', pretrained=pretrained, **kwargs)
+#
+#
+# @register_model
+# def mvitv2_huge_in21k(pretrained=False, **kwargs):
+#     return _create_mvitv2('mvitv2_huge_in21k', pretrained=pretrained, **kwargs)
+
+
 @register_model
-def mvitv2_small_cls(pretrained=False, **kwargs) -> MultiScaleVit:
+def mvitv2_small_cls(pretrained=False, **kwargs):
     return _create_mvitv2('mvitv2_small_cls', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def mvitv2_base_cls(pretrained=False, **kwargs) -> MultiScaleVit:
-    return _create_mvitv2('mvitv2_base_cls', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def mvitv2_large_cls(pretrained=False, **kwargs) -> MultiScaleVit:
-    return _create_mvitv2('mvitv2_large_cls', pretrained=pretrained, **kwargs)
-
-
-@register_model
-def mvitv2_huge_cls(pretrained=False, **kwargs) -> MultiScaleVit:
-    return _create_mvitv2('mvitv2_huge_cls', pretrained=pretrained, **kwargs)

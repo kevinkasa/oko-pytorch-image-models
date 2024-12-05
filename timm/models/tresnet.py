@@ -6,57 +6,104 @@ Original model: https://github.com/mrT23/TResNet
 
 """
 from collections import OrderedDict
-from functools import partial
-from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from timm.layers import SpaceToDepth, BlurPool2d, ClassifierHead, SEModule, ConvNormAct, DropPath
+from timm.layers import SpaceToDepthModule, BlurPool2d, InplaceAbn, ClassifierHead, SEModule
 from ._builder import build_model_with_cfg
-from ._manipulate import checkpoint_seq
-from ._registry import register_model, generate_default_cfgs, register_model_deprecations
+from ._registry import register_model
 
 __all__ = ['TResNet']  # model_registry will add each entrypoint fn to this
+
+
+def _cfg(url='', **kwargs):
+    return {
+        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
+        'crop_pct': 0.875, 'interpolation': 'bilinear',
+        'mean': (0., 0., 0.), 'std': (1., 1., 1.),
+        'first_conv': 'body.conv1.0', 'classifier': 'head.fc',
+        **kwargs
+    }
+
+
+default_cfgs = {
+    'tresnet_m': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_m_1k_miil_83_1-d236afcb.pth'),
+    'tresnet_m_miil_in21k': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_m_miil_in21k-901b6ed4.pth', num_classes=11221),
+    'tresnet_l': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_l_81_5-235b486c.pth'),
+    'tresnet_xl': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_xl_82_0-a2d51b00.pth'),
+    'tresnet_m_448': _cfg(
+        input_size=(3, 448, 448), pool_size=(14, 14),
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_m_448-bc359d10.pth'),
+    'tresnet_l_448': _cfg(
+        input_size=(3, 448, 448), pool_size=(14, 14),
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_l_448-940d0cd1.pth'),
+    'tresnet_xl_448': _cfg(
+        input_size=(3, 448, 448), pool_size=(14, 14),
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_xl_448-8c1815de.pth'),
+
+    'tresnet_v2_l': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tresnet/tresnet_l_v2_83_9-f36e4445.pth'),
+}
+
+
+def IABN2Float(module: nn.Module) -> nn.Module:
+    """If `module` is IABN don't use half precision."""
+    if isinstance(module, InplaceAbn):
+        module.float()
+    for child in module.children():
+        IABN2Float(child)
+    return module
+
+
+def conv2d_iabn(ni, nf, stride, kernel_size=3, groups=1, act_layer="leaky_relu", act_param=1e-2):
+    return nn.Sequential(
+        nn.Conv2d(
+            ni, nf, kernel_size=kernel_size, stride=stride, padding=kernel_size // 2, groups=groups, bias=False),
+        InplaceAbn(nf, act_layer=act_layer, act_param=act_param)
+    )
 
 
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(
-            self,
-            inplanes,
-            planes,
-            stride=1,
-            downsample=None,
-            use_se=True,
-            aa_layer=None,
-            drop_path_rate=0.
-    ):
+    def __init__(self, inplanes, planes, stride=1, downsample=None, use_se=True, aa_layer=None):
         super(BasicBlock, self).__init__()
+        if stride == 1:
+            self.conv1 = conv2d_iabn(inplanes, planes, stride=1, act_param=1e-3)
+        else:
+            if aa_layer is None:
+                self.conv1 = conv2d_iabn(inplanes, planes, stride=2, act_param=1e-3)
+            else:
+                self.conv1 = nn.Sequential(
+                    conv2d_iabn(inplanes, planes, stride=1, act_param=1e-3),
+                    aa_layer(channels=planes, filt_size=3, stride=2))
+
+        self.conv2 = conv2d_iabn(planes, planes, stride=1, act_layer="identity")
+        self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
-        act_layer = partial(nn.LeakyReLU, negative_slope=1e-3)
-
-        self.conv1 = ConvNormAct(inplanes, planes, kernel_size=3, stride=stride, act_layer=act_layer, aa_layer=aa_layer)
-        self.conv2 = ConvNormAct(planes, planes, kernel_size=3, stride=1, apply_act=False)
-        self.act = nn.ReLU(inplace=True)
-
         rd_chs = max(planes * self.expansion // 4, 64)
         self.se = SEModule(planes * self.expansion, rd_channels=rd_chs) if use_se else None
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
 
     def forward(self, x):
         if self.downsample is not None:
             shortcut = self.downsample(x)
         else:
             shortcut = x
+
         out = self.conv1(x)
         out = self.conv2(out)
+
         if self.se is not None:
             out = self.se(out)
-        out = self.drop_path(out) + shortcut
-        out = self.act(out)
+
+        out = out + shortcut
+        out = self.relu(out)
         return out
 
 
@@ -64,47 +111,47 @@ class Bottleneck(nn.Module):
     expansion = 4
 
     def __init__(
-            self,
-            inplanes,
-            planes,
-            stride=1,
-            downsample=None,
-            use_se=True,
-            act_layer=None,
-            aa_layer=None,
-            drop_path_rate=0.,
-    ):
+            self, inplanes, planes, stride=1, downsample=None, use_se=True,
+            act_layer="leaky_relu", aa_layer=None):
         super(Bottleneck, self).__init__()
-        self.downsample = downsample
-        self.stride = stride
-        act_layer = act_layer or partial(nn.LeakyReLU, negative_slope=1e-3)
-
-        self.conv1 = ConvNormAct(
-            inplanes, planes, kernel_size=1, stride=1, act_layer=act_layer)
-        self.conv2 = ConvNormAct(
-            planes, planes, kernel_size=3, stride=stride, act_layer=act_layer, aa_layer=aa_layer)
+        self.conv1 = conv2d_iabn(
+            inplanes, planes, kernel_size=1, stride=1, act_layer=act_layer, act_param=1e-3)
+        if stride == 1:
+            self.conv2 = conv2d_iabn(
+                planes, planes, kernel_size=3, stride=1, act_layer=act_layer, act_param=1e-3)
+        else:
+            if aa_layer is None:
+                self.conv2 = conv2d_iabn(
+                    planes, planes, kernel_size=3, stride=2, act_layer=act_layer, act_param=1e-3)
+            else:
+                self.conv2 = nn.Sequential(
+                    conv2d_iabn(planes, planes, kernel_size=3, stride=1, act_layer=act_layer, act_param=1e-3),
+                    aa_layer(channels=planes, filt_size=3, stride=2))
 
         reduction_chs = max(planes * self.expansion // 8, 64)
         self.se = SEModule(planes, rd_channels=reduction_chs) if use_se else None
 
-        self.conv3 = ConvNormAct(
-            planes, planes * self.expansion, kernel_size=1, stride=1, apply_act=False)
+        self.conv3 = conv2d_iabn(
+            planes, planes * self.expansion, kernel_size=1, stride=1, act_layer="identity")
 
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0 else nn.Identity()
         self.act = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
 
     def forward(self, x):
         if self.downsample is not None:
             shortcut = self.downsample(x)
         else:
             shortcut = x
+
         out = self.conv1(x)
         out = self.conv2(out)
         if self.se is not None:
             out = self.se(out)
         out = self.conv3(out)
-        out = self.drop_path(out) + shortcut
+        out = out + shortcut  # no inplace
         out = self.act(out)
+
         return out
 
 
@@ -118,15 +165,12 @@ class TResNet(nn.Module):
             v2=False,
             global_pool='fast',
             drop_rate=0.,
-            drop_path_rate=0.,
     ):
         self.num_classes = num_classes
         self.drop_rate = drop_rate
-        self.grad_checkpointing = False
         super(TResNet, self).__init__()
 
         aa_layer = BlurPool2d
-        act_layer = nn.LeakyReLU
 
         # TResnet stages
         self.inplanes = int(64 * width_factor)
@@ -135,30 +179,24 @@ class TResNet(nn.Module):
             self.inplanes = self.inplanes // 8 * 8
             self.planes = self.planes // 8 * 8
 
-        dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(layers)).split(layers)]
-        conv1 = ConvNormAct(in_chans * 16, self.planes, stride=1, kernel_size=3, act_layer=act_layer)
+        conv1 = conv2d_iabn(in_chans * 16, self.planes, stride=1, kernel_size=3)
         layer1 = self._make_layer(
-            Bottleneck if v2 else BasicBlock,
-            self.planes, layers[0], stride=1, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[0])
+            Bottleneck if v2 else BasicBlock, self.planes, layers[0], stride=1, use_se=True, aa_layer=aa_layer)
         layer2 = self._make_layer(
-            Bottleneck if v2 else BasicBlock,
-            self.planes * 2, layers[1], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[1])
+            Bottleneck if v2 else BasicBlock, self.planes * 2, layers[1], stride=2, use_se=True, aa_layer=aa_layer)
         layer3 = self._make_layer(
-            Bottleneck,
-            self.planes * 4, layers[2], stride=2, use_se=True, aa_layer=aa_layer, drop_path_rate=dpr[2])
+            Bottleneck, self.planes * 4, layers[2], stride=2, use_se=True, aa_layer=aa_layer)
         layer4 = self._make_layer(
-            Bottleneck,
-            self.planes * 8, layers[3], stride=2, use_se=False, aa_layer=aa_layer, drop_path_rate=dpr[3])
+            Bottleneck, self.planes * 8, layers[3], stride=2, use_se=False, aa_layer=aa_layer)
 
         # body
         self.body = nn.Sequential(OrderedDict([
-            ('s2d', SpaceToDepth()),
+            ('SpaceToDepth', SpaceToDepthModule()),
             ('conv1', conv1),
             ('layer1', layer1),
             ('layer2', layer2),
             ('layer3', layer3),
-            ('layer4', layer4),
-        ]))
+            ('layer4', layer4)]))
 
         self.feature_info = [
             dict(num_chs=self.planes, reduction=2, module=''),  # Not with S2D?
@@ -169,46 +207,44 @@ class TResNet(nn.Module):
         ]
 
         # head
-        self.num_features = self.head_hidden_size = (self.planes * 8) * Bottleneck.expansion
+        self.num_features = (self.planes * 8) * Bottleneck.expansion
         self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate)
 
         # model initialization
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-            if isinstance(m, nn.Linear):
-                m.weight.data.normal_(0, 0.01)
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, InplaceAbn):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
         # residual connections special initialization
         for m in self.modules():
             if isinstance(m, BasicBlock):
-                nn.init.zeros_(m.conv2.bn.weight)
+                m.conv2[1].weight = nn.Parameter(torch.zeros_like(m.conv2[1].weight))  # BN to zero
             if isinstance(m, Bottleneck):
-                nn.init.zeros_(m.conv3.bn.weight)
+                m.conv3[1].weight = nn.Parameter(torch.zeros_like(m.conv3[1].weight))  # BN to zero
+            if isinstance(m, nn.Linear):
+                m.weight.data.normal_(0, 0.01)
 
-    def _make_layer(self, block, planes, blocks, stride=1, use_se=True, aa_layer=None, drop_path_rate=0.):
+    def _make_layer(self, block, planes, blocks, stride=1, use_se=True, aa_layer=None):
         downsample = None
         if stride != 1 or self.inplanes != planes * block.expansion:
             layers = []
             if stride == 2:
                 # avg pooling before 1x1 conv
                 layers.append(nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True, count_include_pad=False))
-            layers += [ConvNormAct(
-                self.inplanes, planes * block.expansion, kernel_size=1, stride=1, apply_act=False)]
+            layers += [conv2d_iabn(
+                self.inplanes, planes * block.expansion, kernel_size=1, stride=1, act_layer="identity")]
             downsample = nn.Sequential(*layers)
 
         layers = []
-        for i in range(blocks):
-            layers.append(block(
-                self.inplanes,
-                planes,
-                stride=stride if i == 0 else 1,
-                downsample=downsample if i == 0 else None,
-                use_se=use_se,
-                aa_layer=aa_layer,
-                drop_path_rate=drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
-            ))
-            self.inplanes = planes * block.expansion
+        layers.append(block(
+            self.inplanes, planes, stride, downsample, use_se=use_se, aa_layer=aa_layer))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(
+                block(self.inplanes, planes, use_se=use_se, aa_layer=aa_layer))
         return nn.Sequential(*layers)
 
     @torch.jit.ignore
@@ -218,31 +254,21 @@ class TResNet(nn.Module):
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable=True):
-        self.grad_checkpointing = enable
+        assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
-        self.head.reset(num_classes, pool_type=global_pool)
+    def reset_classifier(self, num_classes, global_pool='fast'):
+        self.head = ClassifierHead(
+            self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate)
 
     def forward_features(self, x):
-        if self.grad_checkpointing and not torch.jit.is_scripting():
-            x = self.body.s2d(x)
-            x = self.body.conv1(x)
-            x = checkpoint_seq([
-                self.body.layer1,
-                self.body.layer2,
-                self.body.layer3,
-                self.body.layer4],
-                x, flatten=True)
-        else:
-            x = self.body(x)
-        return x
+        return self.body(x)
 
     def forward_head(self, x, pre_logits: bool = False):
-        return self.head(x, pre_logits=pre_logits) if pre_logits else self.head(x)
+        return x if pre_logits else self.head(x)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -250,97 +276,56 @@ class TResNet(nn.Module):
         return x
 
 
-def checkpoint_filter_fn(state_dict, model):
-    if 'body.conv1.conv.weight' in state_dict:
-        return state_dict
-
-    import re
-    state_dict = state_dict.get('model', state_dict)
-    state_dict = state_dict.get('state_dict', state_dict)
-    out_dict = {}
-    for k, v in state_dict.items():
-        k = re.sub(r'conv(\d+)\.0.0', lambda x: f'conv{int(x.group(1))}.conv', k)
-        k = re.sub(r'conv(\d+)\.0.1', lambda x: f'conv{int(x.group(1))}.bn', k)
-        k = re.sub(r'conv(\d+)\.0', lambda x: f'conv{int(x.group(1))}.conv', k)
-        k = re.sub(r'conv(\d+)\.1', lambda x: f'conv{int(x.group(1))}.bn', k)
-        k = re.sub(r'downsample\.(\d+)\.0', lambda x: f'downsample.{int(x.group(1))}.conv', k)
-        k = re.sub(r'downsample\.(\d+)\.1', lambda x: f'downsample.{int(x.group(1))}.bn', k)
-        if k.endswith('bn.weight'):
-            # convert weight from inplace_abn to batchnorm
-            v = v.abs().add(1e-5)
-        out_dict[k] = v
-    return out_dict
-
-
 def _create_tresnet(variant, pretrained=False, **kwargs):
     return build_model_with_cfg(
-        TResNet,
-        variant,
-        pretrained,
-        pretrained_filter_fn=checkpoint_filter_fn,
+        TResNet, variant, pretrained,
         feature_cfg=dict(out_indices=(1, 2, 3, 4), flatten_sequential=True),
-        **kwargs,
-    )
-
-
-def _cfg(url='', **kwargs):
-    return {
-        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
-        'crop_pct': 0.875, 'interpolation': 'bilinear',
-        'mean': (0., 0., 0.), 'std': (1., 1., 1.),
-        'first_conv': 'body.conv1.conv', 'classifier': 'head.fc',
-        **kwargs
-    }
-
-
-default_cfgs = generate_default_cfgs({
-    'tresnet_m.miil_in21k_ft_in1k': _cfg(hf_hub_id='timm/'),
-    'tresnet_m.miil_in21k': _cfg(hf_hub_id='timm/', num_classes=11221),
-    'tresnet_m.miil_in1k': _cfg(hf_hub_id='timm/'),
-    'tresnet_l.miil_in1k': _cfg(hf_hub_id='timm/'),
-    'tresnet_xl.miil_in1k': _cfg(hf_hub_id='timm/'),
-    'tresnet_m.miil_in1k_448': _cfg(
-        input_size=(3, 448, 448), pool_size=(14, 14),
-        hf_hub_id='timm/'),
-    'tresnet_l.miil_in1k_448': _cfg(
-        input_size=(3, 448, 448), pool_size=(14, 14),
-        hf_hub_id='timm/'),
-    'tresnet_xl.miil_in1k_448': _cfg(
-        input_size=(3, 448, 448), pool_size=(14, 14),
-        hf_hub_id='timm/'),
-
-    'tresnet_v2_l.miil_in21k_ft_in1k': _cfg(hf_hub_id='timm/'),
-    'tresnet_v2_l.miil_in21k': _cfg(hf_hub_id='timm/', num_classes=11221),
-})
+        **kwargs)
 
 
 @register_model
-def tresnet_m(pretrained=False, **kwargs) -> TResNet:
-    model_args = dict(layers=[3, 4, 11, 3])
-    return _create_tresnet('tresnet_m', pretrained=pretrained, **dict(model_args, **kwargs))
+def tresnet_m(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[3, 4, 11, 3], **kwargs)
+    return _create_tresnet('tresnet_m', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def tresnet_l(pretrained=False, **kwargs) -> TResNet:
-    model_args = dict(layers=[4, 5, 18, 3], width_factor=1.2)
-    return _create_tresnet('tresnet_l', pretrained=pretrained, **dict(model_args, **kwargs))
+def tresnet_m_miil_in21k(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[3, 4, 11, 3], **kwargs)
+    return _create_tresnet('tresnet_m_miil_in21k', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def tresnet_xl(pretrained=False, **kwargs) -> TResNet:
-    model_args = dict(layers=[4, 5, 24, 3], width_factor=1.3)
-    return _create_tresnet('tresnet_xl', pretrained=pretrained, **dict(model_args, **kwargs))
+def tresnet_l(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[4, 5, 18, 3], width_factor=1.2, **kwargs)
+    return _create_tresnet('tresnet_l', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def tresnet_v2_l(pretrained=False, **kwargs) -> TResNet:
-    model_args = dict(layers=[3, 4, 23, 3], width_factor=1.0, v2=True)
-    return _create_tresnet('tresnet_v2_l', pretrained=pretrained, **dict(model_args, **kwargs))
+def tresnet_v2_l(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[3, 4, 23, 3], width_factor=1.0, v2=True, **kwargs)
+    return _create_tresnet('tresnet_v2_l', pretrained=pretrained, **model_kwargs)
 
 
-register_model_deprecations(__name__, {
-    'tresnet_m_miil_in21k': 'tresnet_m.miil_in21k',
-    'tresnet_m_448': 'tresnet_m.miil_in1k_448',
-    'tresnet_l_448': 'tresnet_l.miil_in1k_448',
-    'tresnet_xl_448': 'tresnet_xl.miil_in1k_448',
-})
+@register_model
+def tresnet_xl(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[4, 5, 24, 3], width_factor=1.3, **kwargs)
+    return _create_tresnet('tresnet_xl', pretrained=pretrained, **model_kwargs)
+
+
+@register_model
+def tresnet_m_448(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[3, 4, 11, 3], **kwargs)
+    return _create_tresnet('tresnet_m_448', pretrained=pretrained, **model_kwargs)
+
+
+@register_model
+def tresnet_l_448(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[4, 5, 18, 3], width_factor=1.2, **kwargs)
+    return _create_tresnet('tresnet_l_448', pretrained=pretrained, **model_kwargs)
+
+
+@register_model
+def tresnet_xl_448(pretrained=False, **kwargs):
+    model_kwargs = dict(layers=[4, 5, 24, 3], width_factor=1.3, **kwargs)
+    return _create_tresnet('tresnet_xl_448', pretrained=pretrained, **model_kwargs)

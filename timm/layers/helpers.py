@@ -32,7 +32,7 @@ def make_divisible(v, divisor=8, min_value=None, round_limit=.9):
 
 
 def extend_tuple(x, n):
-    # pads a tuple to specified n by padding with last value
+    # pdas a tuple to specified n by padding with last value
     if not isinstance(x, (tuple, list)):
         x = (x,)
     else:

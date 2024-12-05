@@ -4,8 +4,6 @@ Hacked together by / Copyright 2022 Ross Wightman
 """
 import io
 import math
-from typing import Optional
-
 import torch
 import torch.distributed as dist
 from PIL import Image
@@ -14,7 +12,7 @@ try:
     import datasets
 except ImportError as e:
     print("Please install Hugging Face datasets package `pip install datasets`.")
-    raise e
+    exit(1)
 from .class_map import load_class_map
 from .reader import Reader
 
@@ -31,14 +29,12 @@ class ReaderHfds(Reader):
 
     def __init__(
             self,
-            name: str,
-            root: Optional[str] = None,
-            split: str = 'train',
-            class_map: dict = None,
-            input_key: str = 'image',
-            target_key: str = 'label',
-            download: bool = False,
-            trust_remote_code: bool = False
+            root,
+            name,
+            split='train',
+            class_map=None,
+            label_key='label',
+            download=False,
     ):
         """
         """
@@ -49,13 +45,11 @@ class ReaderHfds(Reader):
             name,  # 'name' maps to path arg in hf datasets
             split=split,
             cache_dir=self.root,  # timm doesn't expect hidden cache dir for datasets, specify a path
-            trust_remote_code=trust_remote_code
         )
         # leave decode for caller, plus we want easy access to original path names...
-        self.dataset = self.dataset.cast_column(input_key, datasets.Image(decode=False))
+        self.dataset = self.dataset.cast_column('image', datasets.Image(decode=False))
 
-        self.image_key = input_key
-        self.label_key = target_key
+        self.label_key = label_key
         self.remap_class = False
         if class_map:
             self.class_to_idx = load_class_map(class_map)
@@ -67,7 +61,7 @@ class ReaderHfds(Reader):
 
     def __getitem__(self, index):
         item = self.dataset[index]
-        image = item[self.image_key]
+        image = item['image']
         if 'bytes' in image and image['bytes']:
             image = io.BytesIO(image['bytes'])
         else:
@@ -83,4 +77,4 @@ class ReaderHfds(Reader):
 
     def _filename(self, index, basename=False, absolute=False):
         item = self.dataset[index]
-        return item[self.image_key]['path']
+        return item['image']['path']

@@ -8,22 +8,60 @@ Original code and weights from https://github.com/mmaaz60/EdgeNeXt
 Modifications and additions for timm by / Copyright 2022, Ross Wightman
 """
 import math
+from collections import OrderedDict
 from functools import partial
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import trunc_normal_tf_, DropPath, LayerNorm2d, Mlp, create_conv2d, \
-    NormMlpClassifierHead, ClassifierHead
+from timm.layers import trunc_normal_tf_, DropPath, LayerNorm2d, Mlp, SelectAdaptivePool2d, create_conv2d
 from ._builder import build_model_with_cfg
 from ._features_fx import register_notrace_module
 from ._manipulate import named_apply, checkpoint_seq
-from ._registry import register_model, generate_default_cfgs
+from ._registry import register_model
 
 __all__ = ['EdgeNeXt']  # model_registry will add each entrypoint fn to this
+
+
+def _cfg(url='', **kwargs):
+    return {
+        'url': url,
+        'num_classes': 1000, 'input_size': (3, 256, 256), 'pool_size': (8, 8),
+        'crop_pct': 0.9, 'interpolation': 'bicubic',
+        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
+        'first_conv': 'stem.0', 'classifier': 'head.fc',
+        **kwargs
+    }
+
+
+default_cfgs = dict(
+    edgenext_xx_small=_cfg(
+        url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.0/edgenext_xx_small.pth",
+        test_input_size=(3, 288, 288), test_crop_pct=1.0),
+    edgenext_x_small=_cfg(
+        url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.0/edgenext_x_small.pth",
+        test_input_size=(3, 288, 288), test_crop_pct=1.0),
+    # edgenext_small=_cfg(
+    #     url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.0/edgenext_small.pth"),
+    edgenext_small=_cfg(  # USI weights
+        url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.1/edgenext_small_usi.pth",
+        crop_pct=0.95, test_input_size=(3, 320, 320), test_crop_pct=1.0,
+    ),
+    # edgenext_base=_cfg(
+    #     url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.2/edgenext_base_usi.pth"),
+    edgenext_base=_cfg(  # USI weights
+        url="https://github.com/mmaaz60/EdgeNeXt/releases/download/v1.2/edgenext_base_usi.pth",
+        crop_pct=0.95, test_input_size=(3, 320, 320), test_crop_pct=1.0,
+    ),
+
+    edgenext_small_rw=_cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-attn-weights/edgenext_small_rw-sw-b00041bb.pth',
+        test_input_size=(3, 320, 320), test_crop_pct=1.0,
+    ),
+)
 
 
 @register_notrace_module  # reason: FX can't symbolically trace torch.arange in forward method
@@ -37,16 +75,14 @@ class PositionalEncodingFourier(nn.Module):
         self.dim = dim
 
     def forward(self, shape: Tuple[int, int, int]):
-        device = self.token_projection.weight.device
-        dtype = self.token_projection.weight.dtype
-        inv_mask = ~torch.zeros(shape).to(device=device, dtype=torch.bool)
+        inv_mask = ~torch.zeros(shape).to(device=self.token_projection.weight.device, dtype=torch.bool)
         y_embed = inv_mask.cumsum(1, dtype=torch.float32)
         x_embed = inv_mask.cumsum(2, dtype=torch.float32)
         eps = 1e-6
         y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
         x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
 
-        dim_t = torch.arange(self.hidden_dim, dtype=torch.int64, device=device).to(torch.float32)
+        dim_t = torch.arange(self.hidden_dim, dtype=torch.float32, device=inv_mask.device)
         dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / self.hidden_dim)
 
         pos_x = x_embed[:, :, :, None] / dim_t
@@ -58,7 +94,7 @@ class PositionalEncodingFourier(nn.Module):
             (pos_y[:, :, :, 0::2].sin(),
              pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        pos = self.token_projection(pos.to(dtype))
+        pos = self.token_projection(pos)
 
         return pos
 
@@ -131,9 +167,9 @@ class CrossCovarianceAttn(nn.Module):
         attn = (F.normalize(q, dim=-1) @ F.normalize(k, dim=-1).transpose(-2, -1)) * self.temperature
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        x = (attn @ v)
 
-        x = x.permute(0, 3, 1, 2).reshape(B, N, C)
+        x = (attn @ v).permute(0, 3, 1, 2).reshape(B, N, C)
+
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -373,24 +409,14 @@ class EdgeNeXt(nn.Module):
 
         self.stages = nn.Sequential(*stages)
 
-        self.num_features = self.head_hidden_size = dims[-1]
-        if head_norm_first:
-            self.norm_pre = norm_layer(self.num_features)
-            self.head = ClassifierHead(
-                self.num_features,
-                num_classes,
-                pool_type=global_pool,
-                drop_rate=self.drop_rate,
-            )
-        else:
-            self.norm_pre = nn.Identity()
-            self.head = NormMlpClassifierHead(
-                self.num_features,
-                num_classes,
-                pool_type=global_pool,
-                drop_rate=self.drop_rate,
-                norm_layer=norm_layer,
-            )
+        self.num_features = dims[-1]
+        self.norm_pre = norm_layer(self.num_features) if head_norm_first else nn.Identity()
+        self.head = nn.Sequential(OrderedDict([
+                ('global_pool', SelectAdaptivePool2d(pool_type=global_pool)),
+                ('norm', nn.Identity() if head_norm_first else norm_layer(self.num_features)),
+                ('flatten', nn.Flatten(1) if global_pool else nn.Identity()),
+                ('drop', nn.Dropout(self.drop_rate)),
+                ('fc', nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity())]))
 
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
 
@@ -411,12 +437,14 @@ class EdgeNeXt(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
-        self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool)
+    def reset_classifier(self, num_classes=0, global_pool=None):
+        if global_pool is not None:
+            self.head.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+            self.head.flatten = nn.Flatten(1) if global_pool else nn.Identity()
+        self.head.fc = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
         x = self.stem(x)
@@ -425,7 +453,12 @@ class EdgeNeXt(nn.Module):
         return x
 
     def forward_head(self, x, pre_logits: bool = False):
-        return self.head(x, pre_logits=True) if pre_logits else self.head(x)
+        # NOTE nn.Sequential in head broken down since can't call head[:-1](x) in torchscript :(
+        x = self.head.global_pool(x)
+        x = self.head.norm(x)
+        x = self.head.flatten(x)
+        x = self.head.drop(x)
+        return x if pre_logits else self.head.fc(x)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -486,91 +519,54 @@ def _create_edgenext(variant, pretrained=False, **kwargs):
     return model
 
 
-def _cfg(url='', **kwargs):
-    return {
-        'url': url,
-        'num_classes': 1000, 'input_size': (3, 256, 256), 'pool_size': (8, 8),
-        'crop_pct': 0.9, 'interpolation': 'bicubic',
-        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'stem.0', 'classifier': 'head.fc',
-        **kwargs
-    }
-
-
-default_cfgs = generate_default_cfgs({
-    'edgenext_xx_small.in1k': _cfg(
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'edgenext_x_small.in1k': _cfg(
-        hf_hub_id='timm/',
-        test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'edgenext_small.usi_in1k': _cfg(  # USI weights
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 320, 320), test_crop_pct=1.0,
-    ),
-    'edgenext_base.usi_in1k': _cfg(  # USI weights
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 320, 320), test_crop_pct=1.0,
-    ),
-    'edgenext_base.in21k_ft_in1k': _cfg(  # USI weights
-        hf_hub_id='timm/',
-        crop_pct=0.95, test_input_size=(3, 320, 320), test_crop_pct=1.0,
-    ),
-    'edgenext_small_rw.sw_in1k': _cfg(
-        hf_hub_id='timm/',
-        test_input_size=(3, 320, 320), test_crop_pct=1.0,
-    ),
-})
-
-
 @register_model
-def edgenext_xx_small(pretrained=False, **kwargs) -> EdgeNeXt:
+def edgenext_xx_small(pretrained=False, **kwargs):
     # 1.33M & 260.58M @ 256 resolution
     # 71.23% Top-1 accuracy
     # No AA, Color Jitter=0.4, No Mixup & Cutmix, DropPath=0.0, BS=4096, lr=0.006, multi-scale-sampler
     # Jetson FPS=51.66 versus 47.67 for MobileViT_XXS
     # For A100: FPS @ BS=1: 212.13 & @ BS=256: 7042.06 versus FPS @ BS=1: 96.68 & @ BS=256: 4624.71 for MobileViT_XXS
-    model_args = dict(depths=(2, 2, 6, 2), dims=(24, 48, 88, 168), heads=(4, 4, 4, 4))
-    return _create_edgenext('edgenext_xx_small', pretrained=pretrained, **dict(model_args, **kwargs))
+    model_kwargs = dict(depths=(2, 2, 6, 2), dims=(24, 48, 88, 168), heads=(4, 4, 4, 4), **kwargs)
+    return _create_edgenext('edgenext_xx_small', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def edgenext_x_small(pretrained=False, **kwargs) -> EdgeNeXt:
+def edgenext_x_small(pretrained=False, **kwargs):
     # 2.34M & 538.0M @ 256 resolution
     # 75.00% Top-1 accuracy
     # No AA, No Mixup & Cutmix, DropPath=0.0, BS=4096, lr=0.006, multi-scale-sampler
     # Jetson FPS=31.61 versus 28.49 for MobileViT_XS
     # For A100: FPS @ BS=1: 179.55 & @ BS=256: 4404.95 versus FPS @ BS=1: 94.55 & @ BS=256: 2361.53 for MobileViT_XS
-    model_args = dict(depths=(3, 3, 9, 3), dims=(32, 64, 100, 192), heads=(4, 4, 4, 4))
-    return _create_edgenext('edgenext_x_small', pretrained=pretrained, **dict(model_args, **kwargs))
+    model_kwargs = dict(depths=(3, 3, 9, 3), dims=(32, 64, 100, 192), heads=(4, 4, 4, 4), **kwargs)
+    return _create_edgenext('edgenext_x_small', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def edgenext_small(pretrained=False, **kwargs) -> EdgeNeXt:
+def edgenext_small(pretrained=False, **kwargs):
     # 5.59M & 1260.59M @ 256 resolution
     # 79.43% Top-1 accuracy
     # AA=True, No Mixup & Cutmix, DropPath=0.1, BS=4096, lr=0.006, multi-scale-sampler
     # Jetson FPS=20.47 versus 18.86 for MobileViT_S
     # For A100: FPS @ BS=1: 172.33 & @ BS=256: 3010.25 versus FPS @ BS=1: 93.84 & @ BS=256: 1785.92 for MobileViT_S
-    model_args = dict(depths=(3, 3, 9, 3), dims=(48, 96, 160, 304))
-    return _create_edgenext('edgenext_small', pretrained=pretrained, **dict(model_args, **kwargs))
+    model_kwargs = dict(depths=(3, 3, 9, 3), dims=(48, 96, 160, 304),  **kwargs)
+    return _create_edgenext('edgenext_small', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def edgenext_base(pretrained=False, **kwargs) -> EdgeNeXt:
+def edgenext_base(pretrained=False, **kwargs):
     # 18.51M & 3840.93M @ 256 resolution
     # 82.5% (normal) 83.7% (USI) Top-1 accuracy
     # AA=True, Mixup & Cutmix, DropPath=0.1, BS=4096, lr=0.006, multi-scale-sampler
     # Jetson FPS=xx.xx versus xx.xx for MobileViT_S
     # For A100: FPS @ BS=1: xxx.xx & @ BS=256: xxxx.xx
-    model_args = dict(depths=[3, 3, 9, 3], dims=[80, 160, 288, 584])
-    return _create_edgenext('edgenext_base', pretrained=pretrained, **dict(model_args, **kwargs))
+    model_kwargs = dict(depths=[3, 3, 9, 3], dims=[80, 160, 288, 584], **kwargs)
+    return _create_edgenext('edgenext_base', pretrained=pretrained, **model_kwargs)
 
 
 @register_model
-def edgenext_small_rw(pretrained=False, **kwargs) -> EdgeNeXt:
-    model_args = dict(
+def edgenext_small_rw(pretrained=False, **kwargs):
+    model_kwargs = dict(
         depths=(3, 3, 9, 3), dims=(48, 96, 192, 384),
-        downsample_block=True, conv_bias=False, stem_type='overlap')
-    return _create_edgenext('edgenext_small_rw', pretrained=pretrained, **dict(model_args, **kwargs))
+        downsample_block=True, conv_bias=False, stem_type='overlap', **kwargs)
+    return _create_edgenext('edgenext_small_rw', pretrained=pretrained, **model_kwargs)
 

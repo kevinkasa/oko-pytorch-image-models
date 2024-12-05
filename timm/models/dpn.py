@@ -17,9 +17,37 @@ import torch.nn.functional as F
 from timm.data import IMAGENET_DPN_MEAN, IMAGENET_DPN_STD, IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import BatchNormAct2d, ConvNormAct, create_conv2d, create_classifier, get_norm_act_layer
 from ._builder import build_model_with_cfg
-from ._registry import register_model, generate_default_cfgs
+from ._registry import register_model
 
 __all__ = ['DPN']
+
+
+def _cfg(url='', **kwargs):
+    return {
+        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
+        'crop_pct': 0.875, 'interpolation': 'bicubic',
+        'mean': IMAGENET_DPN_MEAN, 'std': IMAGENET_DPN_STD,
+        'first_conv': 'features.conv1_1.conv', 'classifier': 'classifier',
+        **kwargs
+    }
+
+
+default_cfgs = {
+    'dpn48b': _cfg(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'dpn68': _cfg(
+        url='https://github.com/rwightman/pytorch-dpn-pretrained/releases/download/v0.1/dpn68-66bebafa7.pth'),
+    'dpn68b': _cfg(
+        url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/dpn68b_ra-a31ca160.pth',
+        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+    'dpn92': _cfg(
+        url='https://github.com/rwightman/pytorch-dpn-pretrained/releases/download/v0.1/dpn92_extra-b040e4a9b.pth'),
+    'dpn98': _cfg(
+        url='https://github.com/rwightman/pytorch-dpn-pretrained/releases/download/v0.1/dpn98-5b90dec4d.pth'),
+    'dpn131': _cfg(
+        url='https://github.com/rwightman/pytorch-dpn-pretrained/releases/download/v0.1/dpn131-71dfe43e0.pth'),
+    'dpn107': _cfg(
+        url='https://github.com/rwightman/pytorch-dpn-pretrained/releases/download/v0.1/dpn107_extra-1ac7121e2.pth')
+}
 
 
 class CatBnAct(nn.Module):
@@ -229,7 +257,7 @@ class DPN(nn.Module):
 
         blocks['conv5_bn_ac'] = CatBnAct(in_chs, norm_layer=fc_norm_layer)
 
-        self.num_features = self.head_hidden_size = in_chs
+        self.num_features = in_chs
         self.features = nn.Sequential(blocks)
 
         # Using 1x1 conv for the FC layer to allow the extra pooling scheme
@@ -253,10 +281,10 @@ class DPN(nn.Module):
         assert not enable, 'gradient checkpointing not supported'
 
     @torch.jit.ignore
-    def get_classifier(self) -> nn.Module:
+    def get_classifier(self):
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes, global_pool='avg'):
         self.num_classes = num_classes
         self.global_pool, self.classifier = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool, use_conv=True)
@@ -270,9 +298,10 @@ class DPN(nn.Module):
         if self.drop_rate > 0.:
             x = F.dropout(x, p=self.drop_rate, training=self.training)
         if pre_logits:
+            return x.flatten(1)
+        else:
+            x = self.classifier(x)
             return self.flatten(x)
-        x = self.classifier(x)
-        return self.flatten(x)
 
     def forward(self, x):
         x = self.forward_features(x)
@@ -282,90 +311,62 @@ class DPN(nn.Module):
 
 def _create_dpn(variant, pretrained=False, **kwargs):
     return build_model_with_cfg(
-        DPN,
-        variant,
-        pretrained,
+        DPN, variant, pretrained,
         feature_cfg=dict(feature_concat=True, flatten_sequential=True),
-        **kwargs,
-    )
-
-
-def _cfg(url='', **kwargs):
-    return {
-        'url': url, 'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (7, 7),
-        'crop_pct': 0.875, 'interpolation': 'bicubic',
-        'mean': IMAGENET_DPN_MEAN, 'std': IMAGENET_DPN_STD,
-        'first_conv': 'features.conv1_1.conv', 'classifier': 'classifier',
-        **kwargs
-    }
-
-
-default_cfgs = generate_default_cfgs({
-    'dpn48b.untrained': _cfg(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
-    'dpn68.mx_in1k': _cfg(hf_hub_id='timm/'),
-    'dpn68b.ra_in1k': _cfg(
-        hf_hub_id='timm/',
-        mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD,
-        crop_pct=0.95, test_input_size=(3, 288, 288), test_crop_pct=1.0),
-    'dpn68b.mx_in1k': _cfg(hf_hub_id='timm/'),
-    'dpn92.mx_in1k': _cfg(hf_hub_id='timm/'),
-    'dpn98.mx_in1k': _cfg(hf_hub_id='timm/'),
-    'dpn131.mx_in1k': _cfg(hf_hub_id='timm/'),
-    'dpn107.mx_in1k': _cfg(hf_hub_id='timm/')
-})
+        **kwargs)
 
 
 @register_model
-def dpn48b(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn48b(pretrained=False, **kwargs):
+    model_kwargs = dict(
         small=True, num_init_features=10, k_r=128, groups=32,
         b=True, k_sec=(3, 4, 6, 3), inc_sec=(16, 32, 32, 64), act_layer='silu')
-    return _create_dpn('dpn48b', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn48b', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn68(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn68(pretrained=False, **kwargs):
+    model_kwargs = dict(
         small=True, num_init_features=10, k_r=128, groups=32,
         k_sec=(3, 4, 12, 3), inc_sec=(16, 32, 32, 64))
-    return _create_dpn('dpn68', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn68', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn68b(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn68b(pretrained=False, **kwargs):
+    model_kwargs = dict(
         small=True, num_init_features=10, k_r=128, groups=32,
         b=True, k_sec=(3, 4, 12, 3), inc_sec=(16, 32, 32, 64))
-    return _create_dpn('dpn68b', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn68b', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn92(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn92(pretrained=False, **kwargs):
+    model_kwargs = dict(
         num_init_features=64, k_r=96, groups=32,
         k_sec=(3, 4, 20, 3), inc_sec=(16, 32, 24, 128))
-    return _create_dpn('dpn92', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn92', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn98(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn98(pretrained=False, **kwargs):
+    model_kwargs = dict(
         num_init_features=96, k_r=160, groups=40,
         k_sec=(3, 6, 20, 3), inc_sec=(16, 32, 32, 128))
-    return _create_dpn('dpn98', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn98', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn131(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn131(pretrained=False, **kwargs):
+    model_kwargs = dict(
         num_init_features=128, k_r=160, groups=40,
         k_sec=(4, 8, 28, 3), inc_sec=(16, 32, 32, 128))
-    return _create_dpn('dpn131', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn131', pretrained=pretrained, **dict(model_kwargs, **kwargs))
 
 
 @register_model
-def dpn107(pretrained=False, **kwargs) -> DPN:
-    model_args = dict(
+def dpn107(pretrained=False, **kwargs):
+    model_kwargs = dict(
         num_init_features=128, k_r=200, groups=50,
         k_sec=(4, 8, 20, 3), inc_sec=(20, 64, 64, 128))
-    return _create_dpn('dpn107', pretrained=pretrained, **dict(model_args, **kwargs))
+    return _create_dpn('dpn107', pretrained=pretrained, **dict(model_kwargs, **kwargs))

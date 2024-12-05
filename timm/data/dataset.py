@@ -5,9 +5,12 @@ Hacked together by / Copyright 2019, Ross Wightman
 import io
 import logging
 from typing import Optional
+import json
+import os
 
 import torch
 import torch.utils.data as data
+from torchvision.datasets.folder import ImageFolder, default_loader
 from PIL import Image
 
 from .readers import create_reader
@@ -16,6 +19,49 @@ _logger = logging.getLogger(__name__)
 
 
 _ERROR_RETRY = 50
+
+
+class INatDataset(ImageFolder):
+    def __init__(self, root, train=True, year=2018, transform=None, target_transform=None,
+                 category='name', loader=default_loader, **kwargs):
+        self.transform = transform
+        self.loader = loader
+        self.target_transform = target_transform
+        self.year = year
+        self.root = root
+        # assert category in ['kingdom','phylum','class','order','supercategory','family','genus','name']
+        path_json = os.path.join(root, f'{"train" if train else "val"}{year}.json')  # TODO: load test set also
+        with open(path_json) as json_file:
+            data = json.load(json_file)
+        print("train" if train else"val")
+        with open(os.path.join(root, 'categories.json')) as json_file:
+            data_catg = json.load(json_file)
+
+        path_json_for_targeter = os.path.join(root, f"train{year}.json")
+
+        with open(path_json_for_targeter) as json_file:
+            data_for_targeter = json.load(json_file)
+
+        targeter = {}
+        indexer = 0
+        for elem in data_for_targeter['annotations']:
+            king = []
+            king.append(data_catg[int(elem['category_id'])][category])
+            if king[0] not in targeter.keys():
+                targeter[king[0]] = indexer
+                indexer += 1
+        self.nb_classes = len(targeter)
+
+        self.samples = []
+        for elem in data['images']:
+            cut = elem['file_name'].split('/')
+            target_current = int(cut[2])
+            path_current = os.path.join(root, cut[0], cut[1], cut[2], cut[3])
+
+            categors = data_catg[target_current]
+            target_current_true = targeter[categors[category]]
+            self.samples.append((path_current, target_current_true))
+        print(f'num samples: {len(self.samples)}')
 
 
 class ImageDataset(data.Dataset):
@@ -27,22 +73,20 @@ class ImageDataset(data.Dataset):
             split='train',
             class_map=None,
             load_bytes=False,
-            input_img_mode='RGB',
+            img_mode='RGB',
             transform=None,
             target_transform=None,
-            **kwargs,
     ):
         if reader is None or isinstance(reader, str):
             reader = create_reader(
                 reader or '',
                 root=root,
                 split=split,
-                class_map=class_map,
-                **kwargs,
+                class_map=class_map
             )
         self.reader = reader
         self.load_bytes = load_bytes
-        self.input_img_mode = input_img_mode
+        self.img_mode = img_mode
         self.transform = transform
         self.target_transform = target_transform
         self._consecutive_errors = 0
@@ -61,8 +105,8 @@ class ImageDataset(data.Dataset):
                 raise e
         self._consecutive_errors = 0
 
-        if self.input_img_mode and not self.load_bytes:
-            img = img.convert(self.input_img_mode)
+        if self.img_mode and not self.load_bytes:
+            img = img.convert(self.img_mode)
         if self.transform is not None:
             img = self.transform(img)
 
@@ -90,19 +134,13 @@ class IterableImageDataset(data.IterableDataset):
             root,
             reader=None,
             split='train',
-            class_map=None,
             is_training=False,
-            batch_size=1,
-            num_samples=None,
+            batch_size=None,
             seed=42,
             repeats=0,
             download=False,
-            input_img_mode='RGB',
-            input_key=None,
-            target_key=None,
             transform=None,
             target_transform=None,
-            max_steps=None,
     ):
         assert reader is not None
         if isinstance(reader, str):
@@ -110,17 +148,11 @@ class IterableImageDataset(data.IterableDataset):
                 reader,
                 root=root,
                 split=split,
-                class_map=class_map,
                 is_training=is_training,
                 batch_size=batch_size,
-                num_samples=num_samples,
                 seed=seed,
                 repeats=repeats,
                 download=download,
-                input_img_mode=input_img_mode,
-                input_key=input_key,
-                target_key=target_key,
-                max_steps=max_steps,
             )
         else:
             self.reader = reader

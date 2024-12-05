@@ -11,100 +11,37 @@ Hacked together by / Copyright 2020 Ross Wightman
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from timm.layers import Format, _assert
 
-
-__all__ = [
-    'FeatureInfo', 'FeatureHooks', 'FeatureDictNet', 'FeatureListNet', 'FeatureHookNet', 'FeatureGetterNet',
-    'feature_take_indices'
-]
-
-
-def feature_take_indices(
-        num_features: int,
-        indices: Optional[Union[int, List[int]]] = None,
-        as_set: bool = False,
-) -> Tuple[List[int], int]:
-    """ Determine the absolute feature indices to 'take' from.
-
-    Note: This function can be called in forwar() so must be torchscript compatible,
-    which requires some incomplete typing and workaround hacks.
-
-    Args:
-        num_features: total number of features to select from
-        indices: indices to select,
-          None -> select all
-          int -> select last n
-          list/tuple of int -> return specified (-ve indices specify from end)
-        as_set: return as a set
-
-    Returns:
-        List (or set) of absolute (from beginning) indices, Maximum index
-    """
-    if indices is None:
-        indices = num_features  # all features if None
-
-    if isinstance(indices, int):
-        # convert int -> last n indices
-        _assert(0 < indices <= num_features, f'last-n ({indices}) is out of range (1 to {num_features})')
-        take_indices = [num_features - indices + i for i in range(indices)]
-    else:
-        take_indices: List[int] = []
-        for i in indices:
-            idx = num_features + i if i < 0 else i
-            _assert(0 <= idx < num_features, f'feature index {idx} is out of range (0 to {num_features - 1})')
-            take_indices.append(idx)
-
-    if not torch.jit.is_scripting() and as_set:
-        return set(take_indices), max(take_indices)
-
-    return take_indices, max(take_indices)
-
-
-def _out_indices_as_tuple(x: Union[int, Tuple[int, ...]]) -> Tuple[int, ...]:
-    if isinstance(x, int):
-        # if indices is an int, take last N features
-        return tuple(range(-x, 0))
-    return tuple(x)
-
-
-OutIndicesT = Union[int, Tuple[int, ...]]
+__all__ = ['FeatureInfo', 'FeatureHooks', 'FeatureDictNet', 'FeatureListNet', 'FeatureHookNet']
 
 
 class FeatureInfo:
 
-    def __init__(
-            self,
-            feature_info: List[Dict],
-            out_indices: OutIndicesT,
-    ):
-        out_indices = _out_indices_as_tuple(out_indices)
+    def __init__(self, feature_info: List[Dict], out_indices: Tuple[int]):
         prev_reduction = 1
-        for i, fi in enumerate(feature_info):
+        for fi in feature_info:
             # sanity check the mandatory fields, there may be additional fields depending on the model
             assert 'num_chs' in fi and fi['num_chs'] > 0
             assert 'reduction' in fi and fi['reduction'] >= prev_reduction
             prev_reduction = fi['reduction']
             assert 'module' in fi
-            fi.setdefault('index', i)
         self.out_indices = out_indices
         self.info = feature_info
 
-    def from_other(self, out_indices: OutIndicesT):
-        out_indices = _out_indices_as_tuple(out_indices)
+    def from_other(self, out_indices: Tuple[int]):
         return FeatureInfo(deepcopy(self.info), out_indices)
 
-    def get(self, key: str, idx: Optional[Union[int, List[int]]] = None):
+    def get(self, key, idx=None):
         """ Get value by key at specified index (indices)
         if idx == None, returns value for key at each output index
         if idx is an integer, return value for that feature module index (ignoring output indices)
-        if idx is a list/tuple, return value for each module index (ignoring output indices)
+        if idx is a list/tupple, return value for each module index (ignoring output indices)
         """
         if idx is None:
             return [self.info[i][key] for i in self.out_indices]
@@ -113,7 +50,7 @@ class FeatureInfo:
         else:
             return self.info[idx][key]
 
-    def get_dicts(self, keys: Optional[List[str]] = None, idx: Optional[Union[int, List[int]]] = None):
+    def get_dicts(self, keys=None, idx=None):
         """ return info dicts for specified keys (or all if None) at specified indices (or out_indices if None)
         """
         if idx is None:
@@ -126,17 +63,17 @@ class FeatureInfo:
         else:
             return self.info[idx] if keys is None else {k: self.info[idx][k] for k in keys}
 
-    def channels(self, idx: Optional[Union[int, List[int]]] = None):
+    def channels(self, idx=None):
         """ feature channels accessor
         """
         return self.get('num_chs', idx)
 
-    def reduction(self, idx: Optional[Union[int, List[int]]] = None):
+    def reduction(self, idx=None):
         """ feature reduction (output stride) accessor
         """
         return self.get('reduction', idx)
 
-    def module_name(self, idx: Optional[Union[int, List[int]]] = None):
+    def module_name(self, idx=None):
         """ feature module name accessor
         """
         return self.get('module', idx)
@@ -159,30 +96,26 @@ class FeatureHooks:
 
     def __init__(
             self,
-            hooks: Sequence[Union[str, Dict]],
+            hooks: Sequence[str],
             named_modules: dict,
             out_map: Sequence[Union[int, str]] = None,
             default_hook_type: str = 'forward',
     ):
         # setup feature hooks
         self._feature_outputs = defaultdict(OrderedDict)
-        self._handles = []
         modules = {k: v for k, v in named_modules}
         for i, h in enumerate(hooks):
-            hook_name = h if isinstance(h, str) else h['module']
+            hook_name = h['module']
             m = modules[hook_name]
             hook_id = out_map[i] if out_map else hook_name
             hook_fn = partial(self._collect_output_hook, hook_id)
-            hook_type = default_hook_type
-            if isinstance(h, dict):
-                hook_type = h.get('hook_type', default_hook_type)
+            hook_type = h.get('hook_type', default_hook_type)
             if hook_type == 'forward_pre':
-                handle = m.register_forward_pre_hook(hook_fn)
+                m.register_forward_pre_hook(hook_fn)
             elif hook_type == 'forward':
-                handle = m.register_forward_hook(hook_fn)
+                m.register_forward_hook(hook_fn)
             else:
                 assert False, "Unsupported hook type"
-            self._handles.append(handle)
 
     def _collect_output_hook(self, hook_id, *args):
         x = args[-1]  # tensor we want is last argument, output for fwd, input for fwd_pre
@@ -210,7 +143,7 @@ def _module_list(module, flatten_sequential=False):
     return ml
 
 
-def _get_feature_info(net, out_indices: OutIndicesT):
+def _get_feature_info(net, out_indices):
     feature_info = getattr(net, 'feature_info')
     if isinstance(feature_info, FeatureInfo):
         return feature_info.from_other(out_indices)
@@ -246,9 +179,8 @@ class FeatureDictNet(nn.ModuleDict):
     def __init__(
             self,
             model: nn.Module,
-            out_indices: OutIndicesT = (0, 1, 2, 3, 4),
+            out_indices: Tuple[int, ...] = (0, 1, 2, 3, 4),
             out_map: Sequence[Union[int, str]] = None,
-            output_fmt: str = 'NCHW',
             feature_concat: bool = False,
             flatten_sequential: bool = False,
     ):
@@ -263,7 +195,6 @@ class FeatureDictNet(nn.ModuleDict):
         """
         super(FeatureDictNet, self).__init__()
         self.feature_info = _get_feature_info(model, out_indices)
-        self.output_fmt = Format(output_fmt)
         self.concat = feature_concat
         self.grad_checkpointing = False
         self.return_layers = {}
@@ -321,8 +252,7 @@ class FeatureListNet(FeatureDictNet):
     def __init__(
             self,
             model: nn.Module,
-            out_indices: OutIndicesT = (0, 1, 2, 3, 4),
-            output_fmt: str = 'NCHW',
+            out_indices: Tuple[int, ...] = (0, 1, 2, 3, 4),
             feature_concat: bool = False,
             flatten_sequential: bool = False,
     ):
@@ -334,10 +264,9 @@ class FeatureListNet(FeatureDictNet):
                 first element e.g. `x[0]`
             flatten_sequential: Flatten first two-levels of sequential modules in model (re-writes model modules)
         """
-        super().__init__(
+        super(FeatureListNet, self).__init__(
             model,
             out_indices=out_indices,
-            output_fmt=output_fmt,
             feature_concat=feature_concat,
             flatten_sequential=flatten_sequential,
         )
@@ -362,11 +291,10 @@ class FeatureHookNet(nn.ModuleDict):
     def __init__(
             self,
             model: nn.Module,
-            out_indices: OutIndicesT = (0, 1, 2, 3, 4),
-            out_map: Optional[Sequence[Union[int, str]]] = None,
-            return_dict: bool = False,
-            output_fmt: str = 'NCHW',
-            no_rewrite: Optional[bool] = None,
+            out_indices: Tuple[int, ...] = (0, 1, 2, 3, 4),
+            out_map: Sequence[Union[int, str]] = None,
+            out_as_dict: bool = False,
+            no_rewrite: bool = False,
             flatten_sequential: bool = False,
             default_hook_type: str = 'forward',
     ):
@@ -376,20 +304,18 @@ class FeatureHookNet(nn.ModuleDict):
             model: Model from which to extract features.
             out_indices: Output indices of the model features to extract.
             out_map: Return id mapping for each output index, otherwise str(index) is used.
-            return_dict: Output features as a dict.
+            out_as_dict: Output features as a dict.
             no_rewrite: Enforce that model is not re-written if True, ie no modules are removed / changed.
                 flatten_sequential arg must also be False if this is set True.
             flatten_sequential: Re-write modules by flattening first two levels of nn.Sequential containers.
             default_hook_type: The default hook type to use if not specified in model.feature_info.
         """
-        super().__init__()
+        super(FeatureHookNet, self).__init__()
         assert not torch.jit.is_scripting()
         self.feature_info = _get_feature_info(model, out_indices)
-        self.return_dict = return_dict
-        self.output_fmt = Format(output_fmt)
+        self.out_as_dict = out_as_dict
         self.grad_checkpointing = False
-        if no_rewrite is None:
-            no_rewrite = not flatten_sequential
+
         layers = OrderedDict()
         hooks = []
         if no_rewrite:
@@ -430,55 +356,4 @@ class FeatureHookNet(nn.ModuleDict):
             else:
                 x = module(x)
         out = self.hooks.get_output(x.device)
-        return out if self.return_dict else list(out.values())
-
-
-class FeatureGetterNet(nn.ModuleDict):
-    """ FeatureGetterNet
-
-    Wrap models with a feature getter method, like 'get_intermediate_layers'
-
-    """
-    def __init__(
-            self,
-            model: nn.Module,
-            out_indices: OutIndicesT = 4,
-            out_map: Optional[Sequence[Union[int, str]]] = None,
-            return_dict: bool = False,
-            output_fmt: str = 'NCHW',
-            norm: bool = False,
-            prune: bool = True,
-    ):
-        """
-
-        Args:
-            model: Model to wrap.
-            out_indices: Indices of features to extract.
-            out_map: Remap feature names for dict output (WIP, not supported).
-            return_dict: Return features as dictionary instead of list (WIP, not supported).
-            norm: Apply final model norm to all output features (if possible).
-        """
-        super().__init__()
-        if prune and hasattr(model, 'prune_intermediate_layers'):
-            # replace out_indices after they've been normalized, -ve indices will be invalid after prune
-            out_indices = model.prune_intermediate_layers(
-                out_indices,
-                prune_norm=not norm,
-            )
-        self.feature_info = _get_feature_info(model, out_indices)
-        self.model = model
-        self.out_indices = out_indices
-        self.out_map = out_map
-        self.return_dict = return_dict
-        self.output_fmt = Format(output_fmt)
-        self.norm = norm
-
-    def forward(self, x):
-        features = self.model.forward_intermediates(
-            x,
-            indices=self.out_indices,
-            norm=self.norm,
-            output_fmt=self.output_fmt,
-            intermediates_only=True,
-        )
-        return features
+        return out if self.out_as_dict else list(out.values())

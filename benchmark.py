@@ -22,14 +22,20 @@ from timm.data import resolve_data_config
 from timm.layers import set_fast_norm
 from timm.models import create_model, is_model, list_models
 from timm.optim import create_optimizer_v2
-from timm.utils import setup_default_logging, set_jit_fuser, decay_batch_step, check_batch_size_retry, ParseKwargs,\
-    reparameterize_model
+from timm.utils import setup_default_logging, set_jit_fuser, decay_batch_step, check_batch_size_retry, ParseKwargs
 
 has_apex = False
 try:
     from apex import amp
     has_apex = True
 except ImportError:
+    pass
+
+has_native_amp = False
+try:
+    if getattr(torch.cuda.amp, 'autocast') is not None:
+        has_native_amp = True
+except AttributeError:
     pass
 
 try:
@@ -110,11 +116,7 @@ parser.add_argument('--fuser', default='', type=str,
                     help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 parser.add_argument('--fast-norm', default=False, action='store_true',
                     help='enable experimental fast-norm')
-parser.add_argument('--reparam', default=False, action='store_true',
-                    help='Reparameterize model')
 parser.add_argument('--model-kwargs', nargs='*', default={}, action=ParseKwargs)
-parser.add_argument('--torchcompile-mode', type=str, default=None,
-                    help="torch.compile mode (default: None).")
 
 # codegen (model compilation) options
 scripting_group = parser.add_mutually_exclusive_group()
@@ -219,9 +221,7 @@ class BenchmarkRunner:
             device='cuda',
             torchscript=False,
             torchcompile=None,
-            torchcompile_mode=None,
             aot_autograd=False,
-            reparam=False,
             precision='float32',
             fuser='',
             num_warm_iter=10,
@@ -235,7 +235,7 @@ class BenchmarkRunner:
         self.amp_dtype, self.model_dtype, self.data_dtype = resolve_precision(precision)
         self.channels_last = kwargs.pop('channels_last', False)
         if self.amp_dtype is not None:
-            self.amp_autocast = partial(torch.amp.autocast, device_type=device, dtype=self.amp_dtype)
+            self.amp_autocast = partial(torch.cuda.amp.autocast, dtype=self.amp_dtype)
         else:
             self.amp_autocast = suppress
 
@@ -252,13 +252,10 @@ class BenchmarkRunner:
             drop_block_rate=kwargs.pop('drop_block', None),
             **kwargs.pop('model_kwargs', {}),
         )
-        if reparam:
-            self.model = reparameterize_model(self.model)
         self.model.to(
             device=self.device,
             dtype=self.model_dtype,
-            memory_format=torch.channels_last if self.channels_last else None,
-        )
+            memory_format=torch.channels_last if self.channels_last else None)
         self.num_classes = self.model.num_classes
         self.param_count = count_params(self.model)
         _logger.info('Model %s created, param count: %d' % (model_name, self.param_count))
@@ -274,7 +271,7 @@ class BenchmarkRunner:
         elif torchcompile:
             assert has_compile, 'A version of torch w/ torch.compile() is required, possibly a nightly.'
             torch._dynamo.reset()
-            self.model = torch.compile(self.model, backend=torchcompile, mode=torchcompile_mode)
+            self.model = torch.compile(self.model, backend=torchcompile)
             self.compiled = True
         elif aot_autograd:
             assert has_functorch, "functorch is needed for --aot-autograd"

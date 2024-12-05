@@ -3,31 +3,36 @@
 Hacked together by / Copyright 2021, Ross Wightman
 """
 import os
-from typing import Optional
+import wilds
 
 from torchvision.datasets import CIFAR100, CIFAR10, MNIST, KMNIST, FashionMNIST, ImageFolder
+
 try:
     from torchvision.datasets import Places365
+
     has_places365 = True
 except ImportError:
     has_places365 = False
 try:
     from torchvision.datasets import INaturalist
+
     has_inaturalist = True
 except ImportError:
     has_inaturalist = False
 try:
     from torchvision.datasets import QMNIST
+
     has_qmnist = True
 except ImportError:
     has_qmnist = False
 try:
     from torchvision.datasets import ImageNet
+
     has_imagenet = True
 except ImportError:
     has_imagenet = False
 
-from .dataset import IterableImageDataset, ImageDataset
+from .dataset import IterableImageDataset, ImageDataset, INatDataset
 
 _TORCH_BASIC_DS = dict(
     cifar10=CIFAR10,
@@ -53,6 +58,7 @@ def _search_split(root, split):
             if os.path.exists(try_root):
                 return try_root
         return root
+
     if split_name in _TRAIN_SYNONYM:
         root = _try(_TRAIN_SYNONYM)
     elif split_name in _EVAL_SYNONYM:
@@ -61,24 +67,23 @@ def _search_split(root, split):
 
 
 def create_dataset(
-        name: str,
-        root: Optional[str] = None,
-        split: str = 'validation',
-        search_split: bool = True,
-        class_map: dict = None,
-        load_bytes: bool = False,
-        is_training: bool = False,
-        download: bool = False,
-        batch_size: int = 1,
-        num_samples: Optional[int] = None,
-        seed: int = 42,
-        repeats: int = 0,
-        input_img_mode: str = 'RGB',
-        **kwargs,
+        name,
+        root,
+        inat_cat='genus',
+        split='validation',
+        search_split=True,
+        class_map=None,
+        load_bytes=False,
+        is_training=False,
+        download=False,
+        batch_size=None,
+        seed=42,
+        repeats=0,
+        **kwargs
 ):
     """ Dataset factory method
 
-    In parentheses after each arg are the type of dataset supported for each arg, one of:
+    In parenthesis after each arg are the type of dataset supported for each arg, one of:
       * folder - default, timm folder (or tar) based ImageDataset
       * torch - torchvision based datasets
       * HFDS - Hugging Face Datasets
@@ -100,14 +105,13 @@ def create_dataset(
         batch_size: batch size hint for (TFDS, WDS)
         seed: seed for iterable datasets (TFDS, WDS)
         repeats: dataset repeats per iteration i.e. epoch (TFDS, WDS)
-        input_img_mode: Input image color conversion mode e.g. 'RGB', 'L' (folder, TFDS, WDS, HFDS)
         **kwargs: other args to pass to dataset
 
     Returns:
         Dataset object
     """
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
     name = name.lower()
+    print(name)
     if name.startswith('torch/'):
         name = name.split('/', 2)[-1]
         torch_kwargs = dict(root=root, download=download, **kwargs)
@@ -116,9 +120,12 @@ def create_dataset(
             use_train = split in _TRAIN_SYNONYM
             ds = ds_class(train=use_train, **torch_kwargs)
         elif name == 'inaturalist' or name == 'inat':
+            print('in iNat')
             assert has_inaturalist, 'Please update to PyTorch 1.10, torchvision 0.11+ for Inaturalist'
             target_type = 'full'
             split_split = split.split('/')
+            print(split_split)
+            print(split)
             if len(split_split) > 1:
                 target_type = split_split[0].split('_')
                 if len(target_type) == 1:
@@ -128,7 +135,12 @@ def create_dataset(
                 split = '2021_train'
             elif split in _EVAL_SYNONYM:
                 split = '2021_valid'
-            ds = INaturalist(version=split, target_type=target_type, **torch_kwargs)
+            # print(torch_kwargs)
+            # ds = INaturalist(version=split, target_type=target_type, **torch_kwargs)
+            print(split)
+            ds = INatDataset(year=int(split), category=inat_cat, **torch_kwargs)
+            num_classes = ds.nb_classes
+            return ds
         elif name == 'places365':
             assert has_places365, 'Please update to a newer PyTorch and torchvision for Places365 dataset.'
             if split in _TRAIN_SYNONYM:
@@ -136,6 +148,23 @@ def create_dataset(
             elif split in _EVAL_SYNONYM:
                 split = 'val'
             ds = Places365(split=split, **torch_kwargs)
+        elif name == 'iwildcam':
+            print('using iwildcam')
+            # Get the datasets
+            dataset = wilds.get_dataset('iwildcam', download=False, root_dir='/datasets/WILDS/', version='1.0')
+            #print(split)
+
+            if split in _TRAIN_SYNONYM:
+                ds = dataset.get_subset(
+                    "train",
+                )
+                print('train')
+            elif split in _EVAL_SYNONYM:
+                ds = dataset.get_subset(
+                    "id_val",
+                )
+                print('val')
+            return ds
         elif name == 'qmnist':
             assert has_qmnist, 'Please update to a newer PyTorch and torchvision for QMNIST dataset.'
             use_train = split in _TRAIN_SYNONYM
@@ -156,42 +185,17 @@ def create_dataset(
     elif name.startswith('hfds/'):
         # NOTE right now, HF datasets default arrow format is a random-access Dataset,
         # There will be a IterableDataset variant too, TBD
-        ds = ImageDataset(
-            root,
-            reader=name,
-            split=split,
-            class_map=class_map,
-            input_img_mode=input_img_mode,
-            **kwargs,
-        )
-    elif name.startswith('hfids/'):
-        ds = IterableImageDataset(
-            root,
-            reader=name,
-            split=split,
-            class_map=class_map,
-            is_training=is_training,
-            download=download,
-            batch_size=batch_size,
-            num_samples=num_samples,
-            repeats=repeats,
-            seed=seed,
-            input_img_mode=input_img_mode,
-            **kwargs
-        )
+        ds = ImageDataset(root, reader=name, split=split, class_map=class_map, **kwargs)
     elif name.startswith('tfds/'):
         ds = IterableImageDataset(
             root,
             reader=name,
             split=split,
-            class_map=class_map,
             is_training=is_training,
             download=download,
             batch_size=batch_size,
-            num_samples=num_samples,
             repeats=repeats,
             seed=seed,
-            input_img_mode=input_img_mode,
             **kwargs
         )
     elif name.startswith('wds/'):
@@ -199,13 +203,10 @@ def create_dataset(
             root,
             reader=name,
             split=split,
-            class_map=class_map,
             is_training=is_training,
             batch_size=batch_size,
-            num_samples=num_samples,
             repeats=repeats,
             seed=seed,
-            input_img_mode=input_img_mode,
             **kwargs
         )
     else:
@@ -213,12 +214,6 @@ def create_dataset(
         if search_split and os.path.isdir(root):
             # look for split specific sub-folder in root
             root = _search_split(root, split)
-        ds = ImageDataset(
-            root,
-            reader=name,
-            class_map=class_map,
-            load_bytes=load_bytes,
-            input_img_mode=input_img_mode,
-            **kwargs,
-        )
+        ds = ImageDataset(root, reader=name, class_map=class_map, load_bytes=load_bytes, **kwargs)
+
     return ds
