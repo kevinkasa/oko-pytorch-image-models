@@ -2,5 +2,5 @@ from .asymmetric_loss import AsymmetricLossMultiLabel, AsymmetricLossSingleLabel
 from .binary_cross_entropy import BinaryCrossEntropy
 from .cross_entropy import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from .jsd import JsdCrossEntropy
-from .oko_loss import OkoSetLoss
+from .oko_loss import OkoSetLoss, MemoryBank, OkoSetLossHardK
 
