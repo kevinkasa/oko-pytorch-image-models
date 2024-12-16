@@ -229,6 +229,8 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
                    help='LR decay rate (default: 0.1)')
 
 # Augmentation & regularization parameters
+group.add_argument('--hard-k', action='store_true', default=False,
+                   help='Hard k mining for OKO.')
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
@@ -689,7 +691,12 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss()
     mem_bank = MemoryBank(100)
-    train_loss_fn = OkoSetLossHardK(mem_bank)
+    if args.hard_k == True:
+        print('Using hard-k OKO mining')
+        train_loss_fn = OkoSetLossHardK(mem_bank)
+    else:
+        train_loss_fn = OkoSetLoss(mem_bank)
+
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
 

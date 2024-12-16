@@ -169,7 +169,7 @@ class OkoSetLossHardK(nn.Module):
         positive_indices = []
         negative_indices = []
         mb_positives = []  # Will store (set_idx, mb_logit, lbl) for memory bank positives if used
-        pdb.set_trace()
+
         # For each sample in the global batch, attempt to form sets
         for anchor_idx in range(global_batch_size):
             anchor_label = all_targets_np[anchor_idx]
@@ -203,7 +203,6 @@ class OkoSetLossHardK(nn.Module):
                 positive_idx = random.choice(positive_pool)
                 anchor_indices.append(anchor_idx)
                 positive_indices.append(positive_idx)
-            pdb.set_trace()
 
             # Hard negative mining from the current batch
             # Compute hardness: For each candidate in negative_pool, pick the one
@@ -211,10 +210,19 @@ class OkoSetLossHardK(nn.Module):
             negative_logits_candidates = all_x[negative_pool]  # [num_candidates, num_classes]
             # Compute softmax probabilities
             probs = F.softmax(negative_logits_candidates, dim=-1)
-            # Hardness = probability of anchor_label
-            hardness_scores = probs[:, anchor_label]
-            hardest_idx = torch.argmin(hardness_scores).item()
+            probs_except_anchor = probs.clone()
+            probs_except_anchor[:, anchor_label] = -float('inf')
+            hardness_scores = torch.max(probs_except_anchor, dim=-1)[0]
+            hardest_idx = torch.argmax(hardness_scores).item()
             hardest_negative = negative_pool[hardest_idx]
+
+
+            # # Hardness = probability of anchor_label
+            # hardness_scores = probs[:, anchor_label]
+            # hardest_idx = torch.argmax(hardness_scores).item()
+            # hardest_negative = negative_pool[hardest_idx]
+
+
 
             # Add the chosen negative
             negative_indices.append(hardest_negative)
