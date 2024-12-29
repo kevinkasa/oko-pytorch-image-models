@@ -32,7 +32,8 @@ from torch.nn.parallel import DistributedDataParallel as NativeDDP
 from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
-from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, OkoSetLoss, OkoSetLossHardK
+from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, \
+    OkoSetLoss, OkoSetLossHardK
 from timm.loss import MemoryBank
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
@@ -43,6 +44,7 @@ try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
     from apex.parallel import convert_syncbn_model
+
     has_apex = True
 except ImportError:
     has_apex = False
@@ -56,18 +58,19 @@ except AttributeError:
 
 try:
     import wandb
+
     has_wandb = True
 except ImportError:
     has_wandb = False
 
 try:
     from functorch.compile import memory_efficient_fusion
+
     has_functorch = True
 except ImportError as e:
     has_functorch = False
 
 has_compile = hasattr(torch, 'compile')
-
 
 _logger = logging.getLogger('train')
 
@@ -76,7 +79,6 @@ _logger = logging.getLogger('train')
 config_parser = parser = argparse.ArgumentParser(description='Training Config', add_help=False)
 parser.add_argument('-c', '--config', default='', type=str, metavar='FILE',
                     help='YAML config file specifying default arguments')
-
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 
@@ -87,7 +89,7 @@ parser.add_argument('data', nargs='?', metavar='DIR', const=None,
                     help='path to dataset (positional is *deprecated*, use --data-dir)')
 parser.add_argument('--data-dir', metavar='DIR',
                     help='path to dataset (root dir)')
-parser.add_argument('--inat-train', default = True, 
+parser.add_argument('--inat-train', default=True,
                     help='Train or val (iNat only)')
 parser.add_argument('--dataset', metavar='NAME', default='',
                     help='dataset type + name ("<type>/<name>") (default: ImageFolder or ImageTar if empty)')
@@ -99,7 +101,7 @@ group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
-group.add_argument('--inat-cat', default='name', type=str, 
+group.add_argument('--inat-cat', default='name', type=str,
                    help='iNaturalist category to use')
 
 # Model parameters
@@ -231,6 +233,9 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
 # Augmentation & regularization parameters
 group.add_argument('--hard-k', action='store_true', default=False,
                    help='Hard k mining for OKO.')
+group.add_argument('--hard-measure', type=str, default='prob',
+                   help='Hardness measure to use for hard-K OKO'),
+
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
                    help='Disable all training augmentation, override other train aug args')
@@ -565,10 +570,10 @@ def main():
 
     # create the train and eval datasets
     if args.data and not args.data_dir:
-        args.data_dir = args.data # returns num classes only if inat, fix this
+        args.data_dir = args.data  # returns num classes only if inat, fix this
     dataset_train = create_dataset(
         args.dataset,
-        inat_cat = args.inat_cat,
+        inat_cat=args.inat_cat,
         root=args.data_dir,
         split=args.train_split,
         is_training=True,
@@ -577,20 +582,20 @@ def main():
         batch_size=args.batch_size,
         seed=args.seed,
         repeats=args.epoch_repeats,
-        train = True,
+        train=True,
 
     )
     print('num classes: ' + str(args.num_classes))
     dataset_eval = create_dataset(
         args.dataset,
-        inat_cat = args.inat_cat,
+        inat_cat=args.inat_cat,
         root=args.data_dir,
         split=args.val_split,
         is_training=False,
         class_map=args.class_map,
         download=args.dataset_download,
         batch_size=args.batch_size,
-        train = False
+        train=False
     )
 
     # setup mixup / cutmix
@@ -693,8 +698,9 @@ def main():
     mem_bank = MemoryBank(100)
     if args.hard_k == True:
         print('Using hard-k OKO mining')
-        train_loss_fn = OkoSetLossHardK(mem_bank)
+        train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
     else:
+        print('Using regular OKO ')
         train_loss_fn = OkoSetLoss(mem_bank)
 
     train_loss_fn = train_loss_fn.to(device=device)
@@ -825,7 +831,7 @@ def main():
                 )
 
             if saver is not None:
-                #print('saving model')
+                # print('saving model')
                 # save proper checkpoint with eval metric
                 save_metric = eval_metrics[eval_metric]
                 best_metric, best_epoch = saver.save_checkpoint(epoch, metric=save_metric)
@@ -875,8 +881,8 @@ def train_one_epoch(
     last_idx = num_batches_per_epoch - 1
     num_updates = epoch * num_batches_per_epoch
     for batch_idx, (input, target) in enumerate(loader):
-        #print(input)
-        #print(target)
+        # print(input)
+        # print(target)
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
         if not args.prefetcher:
@@ -887,7 +893,7 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)
+            output, emb = model(input)
             loss = loss_fn(output, target)
 
         if not args.distributed:
@@ -998,7 +1004,7 @@ def validate(
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
+                output, _ = model(input)
                 if isinstance(output, (tuple, list)):
                     output = output[0]
 

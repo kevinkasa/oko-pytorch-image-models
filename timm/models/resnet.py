@@ -832,9 +832,9 @@ class ResNet(nn.Module):
         return x if pre_logits else self.fc(x)
 
     def forward(self, x):
-        x = self.forward_features(x)
-        x = self.forward_head(x)
-        return x
+        x_ftr = self.forward_features(x)
+        x = self.forward_head(x_ftr)
+        return x, self.global_pool(x_ftr)
 
 
 def _create_resnet(variant, pretrained=False, **kwargs):

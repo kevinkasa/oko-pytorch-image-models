@@ -120,11 +120,49 @@ class OkoSetLossHardK(nn.Module):
     7. Updates the memory bank with current batch’s logits and labels after computing loss.
     """
 
-    def __init__(self, memory_bank: MemoryBank):
+    def __init__(self, memory_bank: MemoryBank, hardness_method: str = 'prob'):
         super().__init__()
         self.memory_bank = memory_bank
+        self.hardness_method = hardness_method
+        print(f'Hardness measure: {self.hardness_method}')
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def __compute_hardness_scores(
+            self,
+            anchor_label: int,
+            anchor_logits: torch.Tensor,
+            anchor_embedding: torch.Tensor,
+            negative_logits: torch.Tensor,
+            negative_embeddings: torch.Tensor,
+            method: str = 'prob'
+    ):
+        if method == 'prob':
+            probs = F.softmax(negative_logits, dim=-1)
+            probs_except_anchor = probs.clone()
+            probs_except_anchor[:, anchor_label] = -float('inf')
+            hardness_scores = torch.max(probs_except_anchor, dim=-1)[0]
+
+        elif method == 'cdist':
+            anchor_embedding_expanded = anchor_embedding.unsqueeze(0)
+            dists = torch.cdist(anchor_embedding_expanded, negative_embeddings).squeeze(0)
+            hardness_scores = dists
+
+        elif method == 'cosine':
+            anchor_expanded = anchor_embedding.unsqueeze(0).expand(negative_embeddings.size(0), -1)
+            sim = F.cosine_similarity(anchor_expanded, negative_embeddings, dim=-1)
+            hardness_scores = 1 - sim
+
+        elif method == 'kl':
+            prob_anchor = F.softmax(anchor_logits.unsqueeze(0), dim=-1)
+            prob_negative = F.softmax(negative_logits, dim=-1)
+            kl_values = F.kl_div(prob_anchor.log().expand(prob_negative.size(0), -1),
+                                 prob_negative, reduction='none').sum(dim=-1)
+            hardness_scores = kl_values
+        else:
+            raise ValueError(f"Unknown hardness method: {method}")
+
+        return hardness_scores
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
         device = x.device
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -145,10 +183,16 @@ class OkoSetLossHardK(nn.Module):
             all_target_list = [torch.zeros_like(target) for _ in range(world_size)]
             dist.all_gather(all_target_list, target)
             all_target = torch.cat(all_target_list, dim=0)
+
+            # Gather embeddings
+            all_embeddings_list = [torch.zeros_like(embeddings) for _ in range(world_size)]
+            dist.all_gather(all_embeddings_list, embeddings)
+            all_embeddings = torch.cat(all_embeddings_list, dim=0)
         else:
             # Not distributed
             all_x = x
             all_target = target
+            all_embeddings = embeddings
 
         global_batch_size = all_x.size(0)
 
@@ -205,27 +249,42 @@ class OkoSetLossHardK(nn.Module):
                 positive_indices.append(positive_idx)
 
             # Hard negative mining from the current batch
-            # Compute hardness: For each candidate in negative_pool, pick the one
-            # that gives the highest probability to anchor_label.
-            negative_logits_candidates = all_x[negative_pool]  # [num_candidates, num_classes]
-            # Compute softmax probabilities
-            probs = F.softmax(negative_logits_candidates, dim=-1)
-            probs_except_anchor = probs.clone()
-            probs_except_anchor[:, anchor_label] = -float('inf')
-            hardness_scores = torch.max(probs_except_anchor, dim=-1)[0]
+            anchor_logits = all_x[anchor_idx]
+            anchor_embedding = all_embeddings[anchor_idx]
+
+            negative_logits_candidates = all_x[negative_pool]  # [num_negatives, num_classes]
+            negative_embeddings_candidates = all_embeddings[negative_pool]
+            hardness_scores = self.__compute_hardness_scores(
+                anchor_label=anchor_label,
+                anchor_logits=anchor_logits,
+                anchor_embedding=anchor_embedding,
+                negative_logits=negative_logits_candidates,
+                negative_embeddings=negative_embeddings_candidates,
+                method=self.hardness_method
+            )
+
             hardest_idx = torch.argmax(hardness_scores).item()
             hardest_negative = negative_pool[hardest_idx]
+            negative_indices.append(hardest_negative)
 
+            # Compute hardness: For each candidate in negative_pool, pick the one
+            # that gives the highest probability to anchor_label.
+            # negative_logits_candidates = all_x[negative_pool]  # [num_candidates, num_classes]
+            # Compute softmax probabilities
+            # probs = F.softmax(negative_logits_candidates, dim=-1)
+            # probs_except_anchor = probs.clone()
+            # probs_except_anchor[:, anchor_label] = -float('inf')
+            # hardness_scores = torch.max(probs_except_anchor, dim=-1)[0]
+            # hardest_idx = torch.argmax(hardness_scores).item()
+            # hardest_negative = negative_pool[hardest_idx]
 
             # # Hardness = probability of anchor_label
             # hardness_scores = probs[:, anchor_label]
             # hardest_idx = torch.argmax(hardness_scores).item()
             # hardest_negative = negative_pool[hardest_idx]
 
-
-
-            # Add the chosen negative
-            negative_indices.append(hardest_negative)
+            # # Add the chosen negative
+            # negative_indices.append(hardest_negative)
 
             # If we used a memory bank positive, record it
             if positive_indices[-1] == -1:
@@ -478,7 +537,7 @@ class OkoSetLoss(nn.Module):
 
         # Sum the logits: anchor, positive, negative
         summed_logits = anchor_logits + final_positive_logits + negative_logits
-
+        # summed_logits = (anchor_logits + final_positive_logits + negative_logits) / 3
         # Targets for these sets are the anchor's target labels
         target_indices = all_target[anchor_indices_t]
 
