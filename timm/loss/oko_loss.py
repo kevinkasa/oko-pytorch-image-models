@@ -366,6 +366,123 @@ class OkoSetLossHardK(nn.Module):
         return loss
 
 
+class OKOAllTripletsLimited(nn.Module):
+    """
+    Forms ALL valid triplets from the current global batch, but then
+    limits the total number of sets to a specified `max_sets` (if more are formed).
+    """
+
+    def __init__(self, max_sets: int = 512):
+        """
+        Args:
+            max_sets (int): Maximum number of triplets to sample per forward pass.
+        """
+        super().__init__()
+        self.max_sets = max_sets
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Logits of shape [local_batch_size, num_classes].
+            target (torch.Tensor): Class labels of shape [local_batch_size].
+        """
+        device = x.device
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # --- 1) Gather logits and targets across GPUs ---
+        if world_size > 1:
+            # Use the custom all_gather with gradient function for logits
+            gathered_list = list(all_gather_with_grad(x))
+            # Replace the current GPU's portion with the original x that has grad_fn
+            gathered_list[rank] = x  # restore local grad_fn
+            all_x = torch.cat(gathered_list, dim=0)
+
+            # Gather targets using standard all_gather (no grad needed for targets)
+            all_target_list = [torch.zeros_like(target) for _ in range(world_size)]
+            dist.all_gather(all_target_list, target)
+            all_target = torch.cat(all_target_list, dim=0)
+        else:
+            all_x = x
+            all_target = target
+
+        global_batch_size = all_x.size(0)
+        all_targets_np = all_target.cpu().tolist()
+
+        # Build a mapping: label -> list of sample indices
+        label_to_indices: Dict[int, List[int]] = {}
+        for idx, lbl in enumerate(all_targets_np):
+            label_to_indices.setdefault(lbl, []).append(idx)
+
+        # --- 2) Build all triplets (anchor, positive, negative) in a vectorized manner ---
+        # We'll accumulate sets in a list-of-tensors and then cat at the end.
+        triplets_list = []
+        all_indices = torch.arange(global_batch_size, device=device)
+        for c, indices_c in label_to_indices.items():
+            if len(indices_c) < 2:
+                # Can't form pairs from this class, skip
+                continue
+
+            # Convert to a PyTorch tensor for combination ops
+            indices_c_t = torch.tensor(indices_c, device=device, dtype=torch.long)
+
+            # (a) All distinct pairs of this class (anchor, positive)
+            pairs = torch.combinations(indices_c_t, r=2,with_replacement =False)  # shape: [n_pairs, 2]
+
+            # (b) Negatives: gather all indices not in this class
+            neg_mask = torch.ones(global_batch_size, dtype=torch.bool, device=device)
+            neg_mask[indices_c_t] = False
+            neg_indices = all_indices[neg_mask]  # shape [n_neg]
+            if neg_indices.numel() == 0:
+                continue  # no negative
+
+            n_pairs = pairs.size(0)
+            n_neg = neg_indices.size(0)
+
+            pairs_expand = pairs.repeat_interleave(n_neg, dim=0)  # shape: [n_pairs * n_neg, 2]
+            neg_expand = neg_indices.repeat(n_pairs)  # shape: [n_pairs * n_neg]
+            triplets = torch.stack((pairs_expand[:, 0], pairs_expand[:, 1], neg_expand), dim=1)
+            triplets_list.append(triplets)
+
+        if not triplets_list:
+            # No valid triplets
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        all_triplets = torch.cat(triplets_list, dim=0)  # shape [N, 3]
+
+        # --- 3) Filter triplets so anchor belongs to local rank ---
+        local_batch_size = x.size(0)
+        start_idx = rank * local_batch_size
+        end_idx = start_idx + local_batch_size
+
+        anchor_indices = all_triplets[:, 0]
+        local_mask = (anchor_indices >= start_idx) & (anchor_indices < end_idx)
+        if not local_mask.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        valid_triplets = all_triplets[local_mask]  # shape [M, 3]
+
+        # --- 4) Limit the number of triplets to `max_sets` ---
+        num_triplets = valid_triplets.size(0)
+        if num_triplets > self.max_sets:
+            # We can sample randomly or take the first self.max_sets
+            # For best coverage, random sample is typical
+            chosen_indices = torch.randperm(num_triplets, device=device)[:self.max_sets]
+            valid_triplets = valid_triplets[chosen_indices]
+
+        # --- 5) Sum the 3 logits and compute cross-entropy ---
+        anchor_logits = all_x[valid_triplets[:,0]]
+        positive_logits = all_x[valid_triplets[:,1]]
+        negative_logits = all_x[valid_triplets[:,2]]
+
+        summed_logits = anchor_logits + positive_logits + negative_logits
+        anchor_labels = all_target[valid_triplets[:,0]]
+
+        loss = F.cross_entropy(summed_logits, anchor_labels)
+        return loss
+
+
+
 class OkoSetLoss(nn.Module):
     """
     Custom loss that:
