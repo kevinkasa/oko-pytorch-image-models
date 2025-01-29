@@ -70,36 +70,38 @@ class MemoryBank:
         """
         self.max_per_class = max_per_class
         # For each class, we store a FIFO queue of embeddings
-        self.class_to_embeddings = defaultdict(lambda: deque(maxlen=max_per_class))
+        self.storage = defaultdict(lambda: deque(maxlen=self.max_per_class))  # {class: deque of logits}
 
-    def add_samples(self, embeddings: torch.Tensor, labels: torch.Tensor):
+    def add_samples(self, logits: torch.Tensor, labels: torch.Tensor):
         """Add a batch of samples to the memory bank.
 
         Args:
-            embeddings (torch.Tensor): Shape [N, feature_dim]
+            logits (torch.Tensor): Shape [N, n_class]
             labels (torch.Tensor): Shape [N]
         """
         # Move to CPU for long term storage if desired (optional optimization)
         # Here we keep them on GPU for simplicity
-        embeddings = embeddings.detach()
+        logits = logits.detach()
         labels = labels.detach()
 
         # Add each sample to the corresponding class queue
-        for emb, lbl in zip(embeddings, labels):
-            self.class_to_embeddings[lbl.item()].append(emb)
+        for emb, lbl in zip(logits, labels):
+            self.storage[lbl.item()].append(emb)
 
     def get_positive(self, class_label: int) -> torch.Tensor:
-        """Get a positive embedding for the given class label from the memory bank.
+        """Get a positive logits vector for the given class label from the memory bank.
 
         Args:
             class_label (int): The class we need a positive sample for.
 
         Returns:
-            torch.Tensor or None: An embedding of shape [feature_dim] if available, else None.
+            torch.Tensor or None: Logits of shape [n_class] if available, else None.
         """
-        if class_label in self.class_to_embeddings and len(self.class_to_embeddings[class_label]) > 0:
+        if class_label in self.storage and len(self.storage[class_label]) > 0:
             # # Return a recent positive sample (for variety, you could sample randomly)
-            return self.class_to_embeddings[class_label][0]
+            # return self.class_to_embeddings[class_label][0]
+            data_list = list(self.storage[class_label])
+            return torch.stack(data_list, dim=0)
             # pop() removes and returns the rightmost (most recent) element
             # return self.class_to_embeddings[class_label].pop()
         return None
@@ -366,6 +368,64 @@ class OkoSetLossHardK(nn.Module):
         return loss
 
 
+class OKOAllTripletsLimitedMemBank(nn.Module):
+    """
+    Forms ALL valid triplets from the current global batch, but then
+    limits the total number of sets to a specified `max_sets` (if more are formed).
+
+    If a class c has <2 in-batch samples, we form pairs from memory bank data for that class
+    """
+
+    def __init__(self, memory_bank: MemoryBank, max_sets: int = 512):
+        """
+        Args:
+            max_sets (int): Maximum number of triplets to sample per forward pass.
+            memory_bank: memory bank object to store positives
+        """
+        super().__init__()
+        self.max_sets = max_sets
+        self.memory_bank = memory_bank
+
+    def forward(self, x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Logits of shape [local_batch_size, num_classes].
+            target (torch.Tensor): Class labels of shape [local_batch_size].
+        """
+
+        device = x.device
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # --- 1) Gather logits and targets across GPUs ---
+        if world_size > 1:
+            # Use the custom all_gather with gradient function for logits
+            gathered_list = list(all_gather_with_grad(x))
+            # Replace the current GPU's portion with the original x that has grad_fn
+            gathered_list[rank] = x  # restore local grad_fn
+            all_x = torch.cat(gathered_list, dim=0)
+
+            # Gather targets using standard all_gather (no grad needed for targets)
+            all_target_list = [torch.zeros_like(target) for _ in range(world_size)]
+            dist.all_gather(all_target_list, target)
+            all_target = torch.cat(all_target_list, dim=0)
+        else:
+            all_x = x
+            all_target = target
+
+        global_batch_size = all_x.size(0)
+        all_targets_np = all_target.cpu().tolist()
+        # Build a mapping: label -> list of sample indices
+        label_to_indices: Dict[int, List[int]] = {}
+        for idx, lbl in enumerate(all_targets_np):
+            label_to_indices.setdefault(lbl, []).append(idx)
+
+        # --- 2) Build all triplets (anchor, positive, negative) in a vectorized manner ---
+        # We'll accumulate sets in a list-of-tensors and then cat at the end.
+        triplets_list = []
+        all_indices = torch.arange(global_batch_size, device=device)
+
+
 class OKOAllTripletsLimited(nn.Module):
     """
     Forms ALL valid triplets from the current global batch, but then
@@ -427,7 +487,7 @@ class OKOAllTripletsLimited(nn.Module):
             indices_c_t = torch.tensor(indices_c, device=device, dtype=torch.long)
 
             # (a) All distinct pairs of this class (anchor, positive)
-            pairs = torch.combinations(indices_c_t, r=2,with_replacement =False)  # shape: [n_pairs, 2]
+            pairs = torch.combinations(indices_c_t, r=2, with_replacement=False)  # shape: [n_pairs, 2]
 
             # (b) Negatives: gather all indices not in this class
             neg_mask = torch.ones(global_batch_size, dtype=torch.bool, device=device)
@@ -471,16 +531,15 @@ class OKOAllTripletsLimited(nn.Module):
             valid_triplets = valid_triplets[chosen_indices]
 
         # --- 5) Sum the 3 logits and compute cross-entropy ---
-        anchor_logits = all_x[valid_triplets[:,0]]
-        positive_logits = all_x[valid_triplets[:,1]]
-        negative_logits = all_x[valid_triplets[:,2]]
+        anchor_logits = all_x[valid_triplets[:, 0]]
+        positive_logits = all_x[valid_triplets[:, 1]]
+        negative_logits = all_x[valid_triplets[:, 2]]
 
         summed_logits = anchor_logits + positive_logits + negative_logits
-        anchor_labels = all_target[valid_triplets[:,0]]
+        anchor_labels = all_target[valid_triplets[:, 0]]
 
         loss = F.cross_entropy(summed_logits, anchor_labels)
         return loss
-
 
 
 class OkoSetLoss(nn.Module):
