@@ -33,7 +33,7 @@ from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, \
-    OkoSetLoss, OkoSetLossHardK, OKOAllTripletsLimited
+    OkoSetLoss, OkoSetLossHardK, OKOAllTripletsLimited, OKOAllTripletsLimitedMemBank
 from timm.loss import MemoryBank
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
@@ -235,6 +235,8 @@ group.add_argument('--hard-k', action='store_true', default=False,
                    help='Hard k mining for OKO.')
 group.add_argument('--hard-measure', type=str, default='prob',
                    help='Hardness measure to use for hard-K OKO'),
+group.add_argument('--num-trips', type=int, default=512,
+                   help='Number of triplets to use in loss'),
 
 group = parser.add_argument_group('Augmentation and regularization parameters')
 group.add_argument('--no-aug', action='store_true', default=False,
@@ -701,7 +703,7 @@ def main():
         train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
     else:
         print('Using regular OKO ')
-        train_loss_fn = OKOAllTripletsLimited()
+        train_loss_fn = OKOAllTripletsLimitedMemBank(memory_bank=mem_bank, max_sets=args.num_trips)
 
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)

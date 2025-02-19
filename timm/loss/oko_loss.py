@@ -1,4 +1,5 @@
 import pdb
+from typing import Dict, List
 
 import random
 from collections import defaultdict, deque
@@ -100,8 +101,9 @@ class MemoryBank:
         if class_label in self.storage and len(self.storage[class_label]) > 0:
             # # Return a recent positive sample (for variety, you could sample randomly)
             # return self.class_to_embeddings[class_label][0]
-            data_list = list(self.storage[class_label])
-            return torch.stack(data_list, dim=0)
+            # data_list = list(self.storage[class_label])
+            # return torch.stack(data_list, dim=0)
+            return self.storage[class_label][0]
             # pop() removes and returns the rightmost (most recent) element
             # return self.class_to_embeddings[class_label].pop()
         return None
@@ -396,7 +398,6 @@ class OKOAllTripletsLimitedMemBank(nn.Module):
         device = x.device
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
-
         # --- 1) Gather logits and targets across GPUs ---
         if world_size > 1:
             # Use the custom all_gather with gradient function for logits
@@ -415,6 +416,7 @@ class OKOAllTripletsLimitedMemBank(nn.Module):
 
         global_batch_size = all_x.size(0)
         all_targets_np = all_target.cpu().tolist()
+
         # Build a mapping: label -> list of sample indices
         label_to_indices: Dict[int, List[int]] = {}
         for idx, lbl in enumerate(all_targets_np):
@@ -423,7 +425,111 @@ class OKOAllTripletsLimitedMemBank(nn.Module):
         # --- 2) Build all triplets (anchor, positive, negative) in a vectorized manner ---
         # We'll accumulate sets in a list-of-tensors and then cat at the end.
         triplets_list = []
+        # neg_idx = []
+        # mb_logits_list = []  # will directly hold logit values for memory bank pairs
+        # mb_labels_list = []  # will hold labels for pairs for mem bank pairs
+        # mb_neg_idxs = []  # will hold negative idxs from memory bank
         all_indices = torch.arange(global_batch_size, device=device)
+        for c, indices_c in label_to_indices.items():
+            if len(indices_c) >= 2:  # enough samples in-batch
+                # Convert to a PyTorch tensor for combination ops
+                indices_c_t = torch.tensor(indices_c, device=device, dtype=torch.long)
+
+                # (a) All distinct pairs of this class (anchor, positive)
+                pairs = torch.combinations(indices_c_t, r=2, with_replacement=False)  # shape: [n_pairs, 2]
+
+                # (b) Negatives: gather all indices not in this class
+                neg_mask = torch.ones(global_batch_size, dtype=torch.bool, device=device)
+                neg_mask[indices_c_t] = False
+                neg_indices = all_indices[neg_mask]  # shape [n_neg]
+                if neg_indices.numel() == 0:
+                    continue  # no negative
+
+                n_pairs = pairs.size(0)
+                n_neg = neg_indices.size(0)
+
+                pairs_expand = pairs.repeat_interleave(n_neg, dim=0)  # shape: [n_pairs * n_neg, 2]
+                neg_expand = neg_indices.repeat(n_pairs)  # shape: [n_pairs * n_neg]
+                triplets = torch.stack((pairs_expand[:, 0], pairs_expand[:, 1], neg_expand), dim=1)
+                triplets_list.append(triplets)
+            elif len(indices_c) == 1:
+                mb_positive = self.memory_bank.get_positive(c)  # returns logit vector
+                if mb_positive is None or mb_positive.size(0) == 0:
+                    # no memory bank positives either, skip
+                    continue
+
+                # First unsqueeze mb_positive to make it 2D: [1, 1010]
+                mb_positive = mb_positive.unsqueeze(0)
+                # Then concatenate with all_x along dimension 0
+                all_x = torch.cat([all_x, mb_positive], dim=0)
+                # Now concatenate the target
+                all_target = torch.cat([all_target, all_target[indices_c]], dim=0)
+                # tmp_indices = torch.cat([all_indices, torch.tensor([512], device='cuda:0')])
+                indices_c.append(len(all_target) - 1)  # add new index as a pair
+
+                ### Now do same thing as before
+                # Convert to a PyTorch tensor for combination ops
+                indices_c_t = torch.tensor(indices_c, device=device, dtype=torch.long)
+
+                # (a) All distinct pairs of this class (anchor, positive)
+                pairs = torch.combinations(indices_c_t, r=2, with_replacement=False)  # shape: [n_pairs, 2]
+
+                # (b) Negatives: gather all indices not in this class
+                neg_mask = torch.ones(global_batch_size, dtype=torch.bool, device=device)
+                neg_mask[indices_c_t[0]] = False
+                neg_indices = all_indices[neg_mask]  # shape [n_neg]
+                if neg_indices.numel() == 0:
+                    continue  # no negative
+
+                n_pairs = pairs.size(0)
+                n_neg = neg_indices.size(0)
+
+                pairs_expand = pairs.repeat_interleave(n_neg, dim=0)  # shape: [n_pairs * n_neg, 2]
+                neg_expand = neg_indices.repeat(n_pairs)  # shape: [n_pairs * n_neg]
+                triplets = torch.stack((pairs_expand[:, 0], pairs_expand[:, 1], neg_expand), dim=1)
+                triplets_list.append(triplets)
+
+            else: # I think this is redundant
+                continue  # no pairs in batch on mem bank
+
+        if not triplets_list:
+            # No valid triplets
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        # print(f'% of triplets formed: {len(triplets_list) / len(label_to_indices)}')
+        all_triplets = torch.cat(triplets_list, dim=0)  # shape [N, 3]
+
+        # --- 3) Filter triplets so anchor belongs to local rank ---
+        local_batch_size = x.size(0)
+        start_idx = rank * local_batch_size
+        end_idx = start_idx + local_batch_size
+
+        anchor_indices = all_triplets[:, 0]
+        local_mask = (anchor_indices >= start_idx) & (anchor_indices < end_idx)
+        if not local_mask.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        valid_triplets = all_triplets[local_mask]  # shape [M, 3]
+
+        # --- 4) Limit the number of triplets to `max_sets` ---
+        num_triplets = valid_triplets.size(0)
+        if num_triplets > self.max_sets:
+            # We can sample randomly or take the first self.max_sets
+            # For best coverage, random sample is typical
+            chosen_indices = torch.randperm(num_triplets, device=device)[:self.max_sets]
+            valid_triplets = valid_triplets[chosen_indices]
+
+        # --- 5) Sum the 3 logits and compute cross-entropy ---
+        anchor_logits = all_x[valid_triplets[:, 0]]
+        positive_logits = all_x[valid_triplets[:, 1]]
+        negative_logits = all_x[valid_triplets[:, 2]]
+
+        summed_logits = anchor_logits + positive_logits + negative_logits
+        anchor_labels = all_target[valid_triplets[:, 0]]
+
+        loss = F.cross_entropy(summed_logits, anchor_labels)
+        self.memory_bank.add_samples(x, target)
+        # pdb.set_trace()
+        return loss
 
 
 class OKOAllTripletsLimited(nn.Module):
