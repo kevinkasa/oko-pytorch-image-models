@@ -17,8 +17,18 @@ from .readers import create_reader
 
 _logger = logging.getLogger(__name__)
 
-
 _ERROR_RETRY = 50
+
+
+class Plantnet(ImageFolder):
+    def __init__(self, root, split, **kwargs):
+        self.root = root
+        self.split = split
+        super().__init__(self.split_folder, **kwargs)
+
+    @property
+    def split_folder(self):
+        return os.path.join(self.root, self.split)
 
 
 class INatDataset(ImageFolder):
@@ -33,7 +43,7 @@ class INatDataset(ImageFolder):
         path_json = os.path.join(root, f'{"train" if train else "val"}{year}.json')  # TODO: load test set also
         with open(path_json) as json_file:
             data = json.load(json_file)
-        print("train" if train else"val")
+        print("train" if train else "val")
         with open(os.path.join(root, 'categories.json')) as json_file:
             data_catg = json.load(json_file)
 

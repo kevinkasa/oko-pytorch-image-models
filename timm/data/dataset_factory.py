@@ -32,7 +32,7 @@ try:
 except ImportError:
     has_imagenet = False
 
-from .dataset import IterableImageDataset, ImageDataset, INatDataset
+from .dataset import IterableImageDataset, ImageDataset, INatDataset, Plantnet
 
 _TORCH_BASIC_DS = dict(
     cifar10=CIFAR10,
@@ -119,6 +119,9 @@ def create_dataset(
             ds_class = _TORCH_BASIC_DS[name]
             use_train = split in _TRAIN_SYNONYM
             ds = ds_class(train=use_train, **torch_kwargs)
+        elif name == 'plantnet':
+            ds = Plantnet(root=root, split='train' if is_training == True else 'val')
+            return ds
         elif name == 'inaturalist' or name == 'inat':
             print('in iNat')
             assert has_inaturalist, 'Please update to PyTorch 1.10, torchvision 0.11+ for Inaturalist'
@@ -152,7 +155,7 @@ def create_dataset(
             print('using iwildcam')
             # Get the datasets
             dataset = wilds.get_dataset('iwildcam', download=False, root_dir='/datasets/WILDS/', version='1.0')
-            #print(split)
+            # print(split)
 
             if split in _TRAIN_SYNONYM:
                 ds = dataset.get_subset(

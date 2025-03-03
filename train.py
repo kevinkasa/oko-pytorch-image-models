@@ -703,7 +703,7 @@ def main():
         train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
     else:
         print('Using regular OKO ')
-        train_loss_fn = OKOAllTripletsLimitedMemBank(memory_bank=mem_bank, max_sets=args.num_trips)
+        train_loss_fn = OkoSetLoss(memory_bank=mem_bank,)
 
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)

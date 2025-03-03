@@ -20,6 +20,7 @@ from timm.layers import DropBlock2d, DropPath, AvgPool2dSame, BlurPool2d, GroupN
 from ._builder import build_model_with_cfg
 from ._manipulate import checkpoint_seq
 from ._registry import register_model, model_entrypoint
+from ._pretrained import generate_default_cfgs
 
 __all__ = ['ResNet', 'BasicBlock', 'Bottleneck']  # model_registry will add each entrypoint fn to this
 
@@ -35,7 +36,7 @@ def _cfg(url='', **kwargs):
     }
 
 
-default_cfgs = {
+default_cfgs = generate_default_cfgs({
     # ResNet and Wide ResNet
     'resnet10t': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/resnet10t_176_c3-f3215ab1.pth',
@@ -67,6 +68,9 @@ default_cfgs = {
         interpolation='bicubic', first_conv='conv1.0', input_size=(3, 256, 256), pool_size=(8, 8), crop_pct=0.94),
     'resnet50': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rsb-weights/resnet50_a1_0-14fe96d1.pth',
+        interpolation='bicubic', crop_pct=0.95),
+    'resnet50.a2_in1k': _cfg(
+        url='https://github.com/huggingface/pytorch-image-models/releases/download/v0.1-rsb-weights/resnet50_a2_0-a2746f79.pth',
         interpolation='bicubic', crop_pct=0.95),
     'resnet50d': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights/resnet50d_ra2-464e36ba.pth',
@@ -319,7 +323,7 @@ default_cfgs = {
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-rs-weights/resnetrs420_ema-972dee69.pth',
         input_size=(3, 320, 320), pool_size=(10, 10), crop_pct=1.0, test_input_size=(3, 416, 416),
         interpolation='bicubic', first_conv='conv1.0'),
-}
+})
 
 
 def get_padding(kernel_size, stride, dilation=1):
@@ -919,6 +923,14 @@ def resnet50(pretrained=False, **kwargs):
     """
     model_args = dict(block=Bottleneck, layers=[3, 4, 6, 3],  **kwargs)
     return _create_resnet('resnet50', pretrained, **dict(model_args, **kwargs))
+
+@register_model
+def resnet50_a2_in1k(pretrained=False, **kwargs):
+    # Use the same architecture configuration as resnet50
+    model_args = dict(block=Bottleneck, layers=[3, 4, 6, 3], **kwargs)
+    # Here, note that we pass the string 'resnet50.a2_in1k' so that the registry looks up
+    # the corresponding configuration from default_cfgs.
+    return _create_resnet('resnet50.a2_in1k', pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
