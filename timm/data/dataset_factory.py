@@ -32,7 +32,7 @@ try:
 except ImportError:
     has_imagenet = False
 
-from .dataset import IterableImageDataset, ImageDataset, INatDataset, Plantnet
+from .dataset import IterableImageDataset, ImageDataset, INatDataset, Plantnet, INatOKODataset, PlantnetOKO
 
 _TORCH_BASIC_DS = dict(
     cifar10=CIFAR10,
@@ -120,7 +120,11 @@ def create_dataset(
             use_train = split in _TRAIN_SYNONYM
             ds = ds_class(train=use_train, **torch_kwargs)
         elif name == 'plantnet':
-            ds = Plantnet(root=root, split='train' if is_training == True else 'val')
+            if not is_training:
+                ds = Plantnet(root=root, split='val')
+            else:
+                ds = PlantnetOKO(root=root, split='train', **torch_kwargs)
+
             return ds
         elif name == 'inaturalist' or name == 'inat':
             print('in iNat')
@@ -141,7 +145,11 @@ def create_dataset(
             # print(torch_kwargs)
             # ds = INaturalist(version=split, target_type=target_type, **torch_kwargs)
             print(split)
-            ds = INatDataset(year=int(split), category=inat_cat, **torch_kwargs)
+            if is_training:
+                ds = INatOKODataset(year=2019, category=inat_cat,
+                                    root=r'/scratch/ssd004/scratch/kkasa/data/inat_comp/2019/')
+            else:
+                ds = INatDataset(year=int(split), category=inat_cat, **torch_kwargs)
             num_classes = ds.nb_classes
             return ds
         elif name == 'places365':

@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import time
+import pdb
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
@@ -697,13 +698,13 @@ def main():
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         train_loss_fn = nn.CrossEntropyLoss()
-    mem_bank = MemoryBank(100)
-    if args.hard_k == True:
-        print('Using hard-k OKO mining')
-        train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
-    else:
-        print('Using regular OKO ')
-        train_loss_fn = OkoSetLoss(memory_bank=mem_bank,)
+    # mem_bank = MemoryBank(100)
+    # if args.hard_k == True:
+    #     print('Using hard-k OKO mining')
+    #     train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
+    # else:
+    #     print('Using regular OKO ')
+    #     train_loss_fn = OkoSetLoss(memory_bank=mem_bank, )
 
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
@@ -791,6 +792,7 @@ def main():
                 loss_scaler=loss_scaler,
                 model_ema=model_ema,
                 mixup_fn=mixup_fn,
+                n_class=args.num_classes
             )
 
             if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
@@ -863,7 +865,8 @@ def train_one_epoch(
         amp_autocast=suppress,
         loss_scaler=None,
         model_ema=None,
-        mixup_fn=None
+        mixup_fn=None,
+        n_class=1000
 ):
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -875,7 +878,6 @@ def train_one_epoch(
     batch_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
-
     model.train()
 
     end = time.time()
@@ -887,6 +889,7 @@ def train_one_epoch(
         # print(target)
         last_batch = batch_idx == last_idx
         data_time_m.update(time.time() - end)
+
         if not args.prefetcher:
             input, target = input.to(device), target.to(device)
             if mixup_fn is not None:
@@ -895,7 +898,11 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output, emb = model(input)
+            # in OKO, data is loaded as (B, K+2, 224,224) i.e. images are stacked in 'channel' dimension
+            # now re-order this to 'unstack' the sets
+            output, emb = model(input.view(-1, 3, 224, 224))
+            output = output.view(target.shape[0], 3, n_class)  # batch_size, set_size, n_classes
+            output = output.sum(dim=1)  # sum each set
             loss = loss_fn(output, target)
 
         if not args.distributed:

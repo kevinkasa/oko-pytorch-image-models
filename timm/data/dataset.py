@@ -7,8 +7,10 @@ import logging
 from typing import Optional
 import json
 import os
+from collections import defaultdict
 
 import torch
+import numpy as np
 import torch.utils.data as data
 from torchvision.datasets.folder import ImageFolder, default_loader
 from PIL import Image
@@ -30,6 +32,183 @@ class Plantnet(ImageFolder):
     def split_folder(self):
         return os.path.join(self.root, self.split)
 
+class PlantnetOKO(ImageFolder):
+    def __init__(self, root, split, transform=None, target_transform=None, loader=default_loader, **kwargs):
+        self.root = root
+        self.split = split
+
+        # Call parent class initialization
+        super().__init__(self.split_folder, transform=transform, target_transform=target_transform, loader=loader,
+                         **kwargs)
+
+        # Create samples by class dictionary for efficient sampling
+        self.samples_by_class = defaultdict(list)
+        for path, label in self.samples:
+            self.samples_by_class[label].append(path)
+
+        # Precompute other classes for each class
+        self.other_classes = {
+            class_label: np.array([l for l in self.samples_by_class.keys() if l != class_label])
+            for class_label in self.samples_by_class.keys()
+        }
+
+    @property
+    def split_folder(self):
+        return os.path.join(self.root, self.split)
+
+    def __getitem__(self, index):
+        """
+        Get a sample with OKO functionality - returns a concatenation of:
+        1. Current image
+        2. Random image from the same class
+        3. Random image from a different class
+
+        Args:
+            index (int): Index of the sample
+
+        Returns:
+            tuple: (concatenated_images, target) where concatenated_images contains
+                   the current image, a same-class image, and a different-class image
+        """
+        # Get the current sample
+        cur_path, cur_target = self.samples[index]
+
+        # Select a random sample from the same class
+        same_class_samples = self.samples_by_class[cur_target]
+        if len(same_class_samples) > 1:
+            # Exclude the current sample to avoid selecting it
+            available_samples = [p for p in same_class_samples if p != cur_path]
+            same_class_path = np.random.choice(available_samples)
+        else:
+            # If only one sample, use the same sample
+            same_class_path = cur_path
+
+        # Select a random sample from a different class
+        different_class_label = np.random.choice(self.other_classes[cur_target])
+        different_class_samples = self.samples_by_class[different_class_label]
+        different_class_path = np.random.choice(different_class_samples)
+
+        # Load and transform the current image
+        cur_sample = self.loader(cur_path)
+        if self.transform is not None:
+            cur_sample = self.transform(cur_sample)
+        if self.target_transform is not None:
+            cur_target = self.target_transform(cur_target)
+
+        # Initialize the images list with the current sample
+        images = [cur_sample]
+
+        # Load and transform the same-class and different-class images
+        for path in [same_class_path, different_class_path]:
+            image = self.loader(path)
+            if self.transform is not None:
+                image = self.transform(image)
+            images.append(image)
+
+        # Concatenate the images along the first dimension (assuming channel-first format)
+        return np.concatenate(images, axis=0), cur_target
+
+class INatOKODataset(ImageFolder):
+    def __init__(self, root, split='train', year=2018, category='name', transform=None, k=1, loader=default_loader,
+                 target_transform=None):
+        # Initialize the ImageFolder parent class
+        # super().__init__(os.path.join(root, f'train_val{year}'), )
+
+        self.root = root
+        self.split = split
+        self.year = year
+        self.category = category
+        self.transform = transform
+        self.k = k
+        self.loader = loader
+        self.target_transform = target_transform
+
+        path_json = os.path.join(root, f'{split}{year}.json')
+        with open(path_json) as json_file:
+            self.data = json.load(json_file)
+
+        with open(os.path.join(root, 'categories.json')) as json_file:
+            self.data_catg = json.load(json_file)
+
+        path_json_for_targeter = os.path.join(root, f"train{year}.json")
+        with open(path_json_for_targeter) as json_file:
+            data_for_targeter = json.load(json_file)
+
+        self.targeter = {}
+        indexer = 0
+        for elem in data_for_targeter['annotations']:
+            king = self.data_catg[int(elem['category_id'])][category]
+            if king not in self.targeter.keys():
+                self.targeter[king] = indexer
+                indexer += 1
+
+        self.nb_classes = len(self.targeter)
+
+        self.samples = []
+        self.samples_by_class = {}
+
+        for elem in self.data['images']:
+            cut = elem['file_name'].split('/')
+            target_current = int(cut[2])
+            path_current = os.path.join(root, cut[0], cut[1], cut[2], cut[3])
+            categors = self.data_catg[target_current]
+            target_current_true = self.targeter[categors[category]]
+            self.samples.append((path_current, target_current_true))
+
+            if target_current_true not in self.samples_by_class:
+                self.samples_by_class[target_current_true] = []
+            self.samples_by_class[target_current_true].append(path_current)
+
+        # Precompute other classes for each class
+        self.other_classes = {
+            class_label: np.array([l for l in self.samples_by_class.keys() if l != class_label])
+            for class_label in self.samples_by_class.keys()
+        }
+        # Group samples by class
+        self.samples_by_class = defaultdict(list)
+        for path, label in self.samples:
+            self.samples_by_class[label].append(path)
+
+    def __getitem__(self, index: int):
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (sample, target) where target is class_index of the target class.
+        """
+        # current sample
+        cur_path, cur_target = self.samples[index]
+
+        # Select a random sample from the same class
+        same_class_samples = self.samples_by_class[cur_target]
+        same_class_path = np.random.choice(same_class_samples)
+
+        # Select a random sample from a different class for the odd-k sample
+        different_class_label = np.random.choice(self.other_classes[cur_target])
+
+        different_class_samples = self.samples_by_class[different_class_label]
+        different_class_path = np.random.choice(different_class_samples)
+
+        # path, target = self.samples[index]
+        cur_sample = self.loader(cur_path)
+        if self.transform is not None:
+            cur_sample = self.transform(cur_sample)
+        if self.target_transform is not None:
+            cur_target = self.target_transform(cur_target)
+        images = [cur_sample]
+        # targets = [cur_target]
+        for path in [same_class_path, different_class_path]:
+            # Load image using the default loader
+            image = self.loader(path)
+
+            # Apply transformation if specified
+            if self.transform is not None:
+                image = self.transform(image)
+
+            images.append(image)
+            # targets.append(target)
+        return np.concatenate(images, axis=0), cur_target
 
 class INatDataset(ImageFolder):
     def __init__(self, root, train=True, year=2018, transform=None, target_transform=None,
