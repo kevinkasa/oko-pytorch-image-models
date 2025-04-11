@@ -34,7 +34,7 @@ from timm.data import create_dataset, create_loader, resolve_data_config, Mixup,
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, \
     OkoSetLoss, OkoSetLossHardK, OKOAllTripletsLimited, OKOAllTripletsLimitedMemBank
-from timm.loss import MemoryBank
+from timm.loss import MemoryBank, SingleTensorMemoryBank
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
@@ -101,8 +101,8 @@ group.add_argument('--dataset-download', action='store_true', default=False,
                    help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 group.add_argument('--class-map', default='', type=str, metavar='FILENAME',
                    help='path to class to idx mapping file (default: "")')
-group.add_argument('--inat-cat', default='name', type=str,
-                   help='iNaturalist category to use')
+group.add_argument('--cat', default='species', type=str,
+                   help='Taxonomical category to use for Bioscan / iNaturalist')
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
@@ -233,6 +233,8 @@ group.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RAT
 # Augmentation & regularization parameters
 group.add_argument('--hard-k', action='store_true', default=False,
                    help='Hard k mining for OKO.')
+group.add_argument('--oko', action='store_true', default=False,
+                   help='Use OKO loss')
 group.add_argument('--hard-measure', type=str, default='prob',
                    help='Hardness measure to use for hard-K OKO'),
 group.add_argument('--num-trips', type=int, default=512,
@@ -575,7 +577,7 @@ def main():
         args.data_dir = args.data  # returns num classes only if inat, fix this
     dataset_train = create_dataset(
         args.dataset,
-        inat_cat=args.inat_cat,
+        cat=args.cat,
         root=args.data_dir,
         split=args.train_split,
         is_training=True,
@@ -590,7 +592,7 @@ def main():
     print('num classes: ' + str(args.num_classes))
     dataset_eval = create_dataset(
         args.dataset,
-        inat_cat=args.inat_cat,
+        cat=args.cat,
         root=args.data_dir,
         split=args.val_split,
         is_training=False,
@@ -695,15 +697,20 @@ def main():
             train_loss_fn = BinaryCrossEntropy(smoothing=args.smoothing, target_threshold=args.bce_target_thresh)
         else:
             train_loss_fn = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        train_loss_fn = nn.CrossEntropyLoss()
-    mem_bank = MemoryBank(100)
-    if args.hard_k == True:
-        print('Using hard-k OKO mining')
-        train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
-    else:
+    elif args.oko:
+        mem_bank = SingleTensorMemoryBank()
         print('Using regular OKO ')
         train_loss_fn = OkoSetLoss(memory_bank=mem_bank,)
+    else:
+        train_loss_fn = nn.CrossEntropyLoss()
+    # # mem_bank = MemoryBank(3)
+    # mem_bank = SingleTensorMemoryBank()
+    # if args.hard_k == True:
+    #     print('Using hard-k OKO mining')
+    #     train_loss_fn = OkoSetLossHardK(mem_bank, args.hard_measure)
+    # else:
+    #     print('Using regular OKO ')
+    #     train_loss_fn = OkoSetLoss(memory_bank=mem_bank,)
 
     train_loss_fn = train_loss_fn.to(device=device)
     validate_loss_fn = nn.CrossEntropyLoss().to(device=device)

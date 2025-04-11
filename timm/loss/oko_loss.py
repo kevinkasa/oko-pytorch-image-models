@@ -1,5 +1,5 @@
 import pdb
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import random
 from collections import defaultdict, deque
@@ -59,6 +59,81 @@ def all_gather_with_grad(tensor):
     return AllGatherWithGrad.apply(tensor)
 
 
+class SingleTensorMemoryBank:
+    """A memory bank using a single pre-allocated tensor to store all class logits.
+
+    This implementation uses a single tensor of shape [n_classes, n_classes] where
+    each row corresponds to the logits for the corresponding class. This approach
+    maximizes memory efficiency by eliminating Python object overhead and leveraging
+    PyTorch's optimized tensor storage.
+    """
+
+    def __init__(self, n_classes=22622, precision=torch.float16):
+        """
+        Args:
+            n_classes (int): Total number of classes in the dataset.
+            precision (torch.dtype): Precision to use for storage.
+        """
+        self.n_classes = n_classes
+        self.precision = precision
+
+        # Pre-allocate a single tensor to store all class logits
+        # Shape: [n_classes, n_classes]
+        self.storage = torch.zeros((n_classes, n_classes), dtype=precision)
+
+        # Keep track of which classes have been observed
+        self.class_seen = torch.zeros(n_classes, dtype=torch.bool)
+
+    def add_samples(self, logits: torch.Tensor, labels: torch.Tensor):
+        """Add a batch of samples to the memory bank.
+
+        Args:
+            logits (torch.Tensor): Shape [N, n_class]
+            labels (torch.Tensor): Shape [N]
+        """
+        # Convert to specified precision and move to CPU
+        logits = logits.to(self.precision).detach().cpu()
+        labels = labels.detach().cpu()
+
+        # Process each sample
+        for emb, lbl in zip(logits, labels):
+            class_id = lbl.item()
+
+            # Skip if class_id is out of range
+            if not (0 <= class_id < self.n_classes):
+                continue
+
+            # Store the logits for this class
+            self.storage[class_id] = emb
+
+            # Mark this class as seen
+            self.class_seen[class_id] = True
+
+
+    def get_positive(self, class_label: int, target_dtype=None) -> Optional[torch.Tensor]:
+        """Get a positive logits vector for the given class label.
+
+        Args:
+            class_label (int): The class we need a positive sample for.
+            target_dtype (torch.dtype, optional): Target data type for the returned tensor.
+
+        Returns:
+            torch.Tensor or None: Logits vector if available, else None.
+        """
+        # Check if the class is in range and has been seen
+        if not (0 <= class_label < self.n_classes) or not self.class_seen[class_label]:
+            return None
+
+        # Get the stored logits for this class
+        positive = self.storage[class_label]
+
+        # Convert to target data type if needed
+        if target_dtype is not None and positive.dtype != target_dtype:
+            positive = positive.to(dtype=target_dtype)
+
+        return positive
+
+
 class MemoryBank:
     """A memory bank for storing embeddings and labels to supplement
     current batch samples when forming triplet sets.
@@ -82,8 +157,8 @@ class MemoryBank:
         """
         # Move to CPU for long term storage if desired (optional optimization)
         # Here we keep them on GPU for simplicity
-        logits = logits.detach()
-        labels = labels.detach()
+        logits = logits.detach().cpu()
+        labels = labels.detach().cpu()
 
         # Add each sample to the corresponding class queue
         for emb, lbl in zip(logits, labels):
@@ -103,7 +178,9 @@ class MemoryBank:
             # return self.class_to_embeddings[class_label][0]
             # data_list = list(self.storage[class_label])
             # return torch.stack(data_list, dim=0)
-            return self.storage[class_label][0]
+            return self.storage[class_label][-1]
+            # samples = list(self.storage[class_label])
+            # return random.choice(samples)
             # pop() removes and returns the rightmost (most recent) element
             # return self.class_to_embeddings[class_label].pop()
         return None
@@ -489,7 +566,7 @@ class OKOAllTripletsLimitedMemBank(nn.Module):
                 triplets = torch.stack((pairs_expand[:, 0], pairs_expand[:, 1], neg_expand), dim=1)
                 triplets_list.append(triplets)
 
-            else: # I think this is redundant
+            else:  # I think this is redundant
                 continue  # no pairs in batch on mem bank
 
         if not triplets_list:
@@ -739,7 +816,7 @@ class OkoSetLoss(nn.Module):
             negative_idx = random.choice(negative_pool)
             if len(positive_pool) == 0:
                 # Try the memory bank if no positive in current batch
-                mb_pos = self.memory_bank.get_positive(anchor_label)
+                mb_pos = self.memory_bank.get_positive(class_label=anchor_label)
                 if mb_pos is None:
                     # No positive in memory bank, skip this anchor
                     continue

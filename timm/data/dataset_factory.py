@@ -6,6 +6,7 @@ import os
 import wilds
 
 from torchvision.datasets import CIFAR100, CIFAR10, MNIST, KMNIST, FashionMNIST, ImageFolder
+from bioscan_dataset import BIOSCAN5M
 
 try:
     from torchvision.datasets import Places365
@@ -69,7 +70,7 @@ def _search_split(root, split):
 def create_dataset(
         name,
         root,
-        inat_cat='genus',
+        cat='genus',
         split='validation',
         search_split=True,
         class_map=None,
@@ -122,6 +123,11 @@ def create_dataset(
         elif name == 'plantnet':
             ds = Plantnet(root=root, split='train' if is_training == True else 'val')
             return ds
+        elif name == 'bioscan5m':
+            ds = BIOSCAN5M(root='/datasets/bioscan/bioscan-5m/', split='train' if is_training else 'val',
+                           modality='image', target_type=cat)
+            print(f'Target type {cat}')
+            return ds
         elif name == 'inaturalist' or name == 'inat':
             print('in iNat')
             assert has_inaturalist, 'Please update to PyTorch 1.10, torchvision 0.11+ for Inaturalist'
@@ -141,7 +147,7 @@ def create_dataset(
             # print(torch_kwargs)
             # ds = INaturalist(version=split, target_type=target_type, **torch_kwargs)
             print(split)
-            ds = INatDataset(year=int(split), category=inat_cat, **torch_kwargs)
+            ds = INatDataset(year=int(split), category=cat, **torch_kwargs)
             num_classes = ds.nb_classes
             return ds
         elif name == 'places365':
