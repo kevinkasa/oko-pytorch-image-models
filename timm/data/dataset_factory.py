@@ -3,7 +3,9 @@
 Hacked together by / Copyright 2021, Ross Wightman
 """
 import os
+import json
 import wilds
+from torch.utils.data import Subset
 
 from torchvision.datasets import CIFAR100, CIFAR10, MNIST, KMNIST, FashionMNIST, ImageFolder
 from bioscan_dataset import BIOSCAN5M
@@ -128,6 +130,21 @@ def create_dataset(
                            modality='image', target_type=cat)
             print(f'Target type {cat}')
             return ds
+        elif name == 'bioscan5m_sub':
+            print('Using BS5M subset')
+            ds = BIOSCAN5M(root='/datasets/bioscan/bioscan-5m/', split='train' if is_training else 'val',
+                           modality='image', target_type=cat)
+            idx_path = r'/scratch/ssd004/scratch/kkasa/code/oko-pytorch-image-models/train_subset_idx.json'
+            with open(idx_path, 'r') as f:
+                data = json.load(f)
+            if data['metadata']['target_type'] != cat:
+                print(
+                    f"Warning: Saved indices were generated for target_type='{data['metadata']['target_type']}',"
+                    f" but you are using target_type = {cat}")
+            idx_move = data['indices_to_move']
+            filtered_train_idx = [i for i in range(len(ds)) if i not in idx_move]
+            filtered_ds = Subset(ds, filtered_train_idx)
+            return filtered_ds
         elif name == 'inaturalist' or name == 'inat':
             print('in iNat')
             assert has_inaturalist, 'Please update to PyTorch 1.10, torchvision 0.11+ for Inaturalist'
