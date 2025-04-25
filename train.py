@@ -33,7 +33,7 @@ from timm import utils
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
 from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, \
-    OkoSetLoss, OkoSetLossHardK, OKOAllTripletsLimited, OKOAllTripletsLimitedMemBank
+    OkoSetLoss, OkoSetLossHardK, OKOAllTripletsLimited, OKOAllTripletsLimitedMemBank, FocalLoss
 from timm.loss import MemoryBank, SingleTensorMemoryBank
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint, model_parameters
 from timm.optim import create_optimizer_v2, optimizer_kwargs
@@ -299,6 +299,9 @@ group.add_argument('--drop-path', type=float, default=None, metavar='PCT',
                    help='Drop path rate (default: None)')
 group.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                    help='Drop block rate (default: None)')
+group.add_argument('--focal', action='store_true', default=False,
+                   help='Use focal loss')
+
 
 # Batch norm parameters (only works with gen_efficientnet based models currently)
 group = parser.add_argument_group('Batch norm parameters', 'Only works with gen_efficientnet based models currently.')
@@ -701,6 +704,9 @@ def main():
         mem_bank = SingleTensorMemoryBank()
         print('Using regular OKO ')
         train_loss_fn = OkoSetLoss(memory_bank=mem_bank,)
+    elif args.focal:
+        train_loss_fn = FocalLoss(gamma=1)
+        print('Using focal loss')
     else:
         train_loss_fn = nn.CrossEntropyLoss()
     # # mem_bank = MemoryBank(3)
